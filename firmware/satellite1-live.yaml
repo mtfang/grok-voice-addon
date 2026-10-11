@@ -7,7 +7,7 @@
 # and ignored if re-enabled).
 #   "Grok live voice" switch ON (default): Hey Grok -> grok_stream live session (full duplex, barge-in)
 #   switch OFF:                            Hey Grok -> stock Home Assistant Assist pipeline (turn-based)
-# Center button = stock Assist (unchanged).
+# Center button = stock Assist; during a live Grok conversation it ends the conversation instead.
 
 substitutions:
   name: satellite1-d98894
@@ -115,6 +115,11 @@ logger:
 
 # ---------------- from satellite1.base.yaml (v0.2.1), unchanged ----------------
 globals:
+  # set when the action button ended a live Grok session, so the same click doesn't also start stock Assist
+  - id: grok_button_dismissed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: init_in_progress
     type: bool
     restore_value: no
@@ -351,6 +356,13 @@ voice_assistant:
         decibel_reduction: 0
         duration: 1.0s
   on_start:
+    - if:
+        condition:
+          lambda: return id(grok_button_dismissed);
+        then:
+          # this click already ended a live Grok conversation; don't start Assist too
+          - lambda: id(grok_button_dismissed) = false;
+          - voice_assistant.stop:
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
         decibel_reduction: 20
@@ -491,8 +503,8 @@ grok_stream:
     microphone: sat1_mics
     channels: 0                 # XMOS AEC+IC+NS+AGC channel
   speaker: grok_resampling_speaker
-  idle_timeout: 15s             # device-side safety net; the add-on hangs up after 8 s of silence
-  max_duration: 130s            # add-on cap is 120 s
+  idle_timeout: 30s             # no bytes from the add-on for 30 s (it pings every 5 s) -> hang up
+  max_duration: 660s            # safety net only; the add-on decides (dismissal / idle_timeout_s / max_session_s 600)
   on_start:
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
@@ -525,3 +537,16 @@ grok_stream:
           - delay: 1s
           - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
           - script.execute: control_leds
+
+# Action button during a live Grok conversation: end it (the stock single-click handler would start Assist).
+binary_sensor:
+  - id: !extend btn_action
+    on_press:
+      - if:
+          condition:
+            grok_stream.is_running: grok
+          then:
+            - lambda: id(grok_button_dismissed) = true;
+            - grok_stream.stop: grok
+            - delay: 2s
+            - lambda: id(grok_button_dismissed) = false;

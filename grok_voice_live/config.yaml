@@ -1,6 +1,6 @@
 # No `image:` key -> Supervisor builds this add-on locally from the Dockerfile.
 name: Grok Voice Live
-version: "0.3.1"
+version: "0.4.0"
 slug: grok_voice_live
 description: Live speech-to-speech Grok (xAI realtime) bridge for Satellite1 devices, with Home Assistant MCP tools
 url: https://github.com/mtfang/grok-voice-addon
@@ -24,11 +24,12 @@ options:
   allowed_clients: []
   voice: sirius
   model: grok-voice-latest
-  idle_timeout_s: 8
-  max_session_s: 120
+  idle_timeout_s: 75
+  max_session_s: 600
   local_vad_barge_in: true
   eq_enabled: true
   vad_gate: true
+  echo_cancel: true
   input_gain_db: 0
   debug_dump_s: 0
   log_level: info
@@ -41,12 +42,18 @@ schema:
     - str
   voice: str
   model: str
-  idle_timeout_s: int(3,60)
-  max_session_s: int(10,600)
+  idle_timeout_s: int(3,600)
+  max_session_s: int(10,3600)
   local_vad_barge_in: bool
   eq_enabled: bool
   output_rate: list(48000|24000|16000)?
   vad_gate: bool
+  echo_cancel: bool
+  barge_threshold: float(0.3,0.99)?
+  barge_min_speech_ms: int(96,1500)?
+  barge_margin_db: float(0,30)?
+  barge_frac: float(0.05,1)?
+  echo_tail_ms: int(0,2000)?
   input_gain_db: float(-20,40)
   debug_dump_s: int(0,60)
   log_level: list(debug|info|warning|error)
