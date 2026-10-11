@@ -91,3 +91,19 @@ and the same realtime session is kept across barge-ins and tool calls, so earlie
 One bridge serves any number of devices at once: one session per device (keyed by the device name from its
 hello; a new wake from the same device replaces its old session), separate echo-canceller state per device,
 and every log line is tagged `[device-name]`.
+
+## 0.4.2
+
+- **Several Satellites, one "Hey Grok"**: hellos arriving within `arbitration_window_ms` (350 ms) are arbitrated;
+  the device that heard the wake word loudest (`wake_rms_db` in its hello) answers, the others get
+  `grok-stand-down` and go quietly back to wake listening. A wake outside the window is an independent session.
+- **Idle**: `idle_timeout_s` default 10 s, counted only in true silence (never while Grok speaks, a tool call or
+  its spoken result is pending, or the user talks).
+- **Loud playback**: Grok plays at most `playback_volume_cap` (0.7) of full volume (the device reports its media
+  player volume); EQ preamp +2 dB (`eq_preamp_db`) and limiter ceiling -3 dBFS (`eq_ceiling_db`) keep the speaker
+  linear. Firmware streams XMOS ch1 (AEC+IC+NS, no AGC, fixed x6 gain) instead of the AGC channel.
+- **Barge-in**: at least 50% of the barge window must be above the predicted echo while Grok plays
+  (`barge_frac_floor`); stricter when the measured echo coupling is high (`barge_hv_*`). Device playback markers
+  are smoothed (median of 7) instead of shifting the echo reference on every marker.
+- **Logs**: startup shows the live agent's tools (HA home tools, hidden ones, xAI web/X search); a device-ended
+  session logs `client_stop (<reason>)` (action_button, ha_switch_off, device_idle_timeout, stand_down, ...).
