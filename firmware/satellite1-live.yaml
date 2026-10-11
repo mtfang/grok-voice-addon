@@ -277,8 +277,12 @@ micro_wake_word:
                     condition:
                       grok_stream.is_running: grok
                     then:
-                      # Saying the wake word again ends the live session.
-                      - grok_stream.stop: grok
+                      # During a live Grok conversation wake words (and the stop word) do NOT end it: Grok's own
+                      # voice or an interruption ("stop, ...") could trip them; barge-in is handled by the bridge.
+                      # Only the action button, the hang_up tool, idle/max timeouts or the switch end a session.
+                      - logger.log:
+                          format: "Ignoring wake word '%s' during a live Grok session"
+                          args: ['wake_word.c_str()']
                     else:
                       - if:
                           condition:
@@ -493,6 +497,14 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     entity_category: config
+    on_turn_off:
+      - if:
+          condition:
+            grok_stream.is_running: grok
+          then:
+            - grok_stream.stop:
+                id: grok
+                reason: ha_switch_off
 
 grok_stream:
   id: grok
@@ -547,6 +559,8 @@ binary_sensor:
             grok_stream.is_running: grok
           then:
             - lambda: id(grok_button_dismissed) = true;
-            - grok_stream.stop: grok
+            - grok_stream.stop:
+                id: grok
+                reason: action_button
             - delay: 2s
             - lambda: id(grok_button_dismissed) = false;

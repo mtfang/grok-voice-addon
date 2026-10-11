@@ -81,13 +81,25 @@ async def to_code(config):
 
 
 GROK_ACTION_SCHEMA = maybe_simple_id({cv.GenerateID(): cv.use_id(GrokStream)})
+GROK_STOP_SCHEMA = maybe_simple_id({
+    cv.GenerateID(): cv.use_id(GrokStream),
+    cv.Optional("reason"): cv.templatable(cv.string),
+})
 
 
 @automation.register_action("grok_stream.start", StartAction, GROK_ACTION_SCHEMA, synchronous=True)
-@automation.register_action("grok_stream.stop", StopAction, GROK_ACTION_SCHEMA, synchronous=True)
 async def grok_action_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@automation.register_action("grok_stream.stop", StopAction, GROK_STOP_SCHEMA, synchronous=True)
+async def grok_stop_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    if "reason" in config:
+        cg.add(var.set_reason(await cg.templatable(config["reason"], args, cg.std_string)))
     return var
 
 

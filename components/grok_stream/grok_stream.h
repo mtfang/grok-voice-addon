@@ -42,7 +42,7 @@ class GrokStream : public Component {
   void set_max_duration(uint32_t ms) { this->max_duration_ms_ = ms; }
 
   void start();
-  void stop();
+  void stop(const std::string &reason = "stopped");
   bool is_running() const { return this->state_.load() != State::IDLE; }
 
   Trigger<> *get_start_trigger() { return &this->start_trigger_; }
@@ -94,6 +94,7 @@ class GrokStream : public Component {
   size_t pending_off_{0};
   uint32_t last_rx_ms_{0};
   std::string end_reason_;  // net task only
+  std::string stop_reason_req_;  // reason of a local stop() request (guarded by q_mutex_)
 
   // playback-start markers ("grok-played"): when reply audio starts entering the speaker after an idle speaker,
   // report which reply sample it was and how many mic samples had been captured at that moment, so the bridge
@@ -118,7 +119,10 @@ template<typename... Ts> class StartAction : public Action<Ts...>, public Parent
 };
 template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<GrokStream> {
  public:
-  void play(const Ts &...x) override { this->parent_->stop(); }
+  TEMPLATABLE_VALUE(std::string, reason)
+  void play(const Ts &...x) override {
+    this->parent_->stop(this->reason_.has_value() ? this->reason_.value(x...) : std::string("action"));
+  }
 };
 template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<GrokStream> {
  public:

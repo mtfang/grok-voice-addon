@@ -92,6 +92,10 @@ void GrokStream::start() {
     return;
   }
   this->stop_requested_ = false;
+  {
+    std::lock_guard<std::mutex> lock(this->q_mutex_);
+    this->stop_reason_req_.clear();
+  }
   this->mic_rb_->reset();
   this->spk_rb_->reset();
   this->mic_written_ = 0;
@@ -104,8 +108,14 @@ void GrokStream::start() {
   xTaskNotifyGive(this->net_task_handle_);
 }
 
-void GrokStream::stop() {
-  if (this->state_.load() != State::IDLE) this->stop_requested_ = true;
+void GrokStream::stop(const std::string &reason) {
+  if (this->state_.load() == State::IDLE) return;
+  {
+    std::lock_guard<std::mutex> lock(this->q_mutex_);
+    this->stop_reason_req_ = reason;
+  }
+  ESP_LOGI(TAG, "stop requested: %s", reason.c_str());
+  this->stop_requested_ = true;
 }
 
 void GrokStream::post_(const std::string &kind, const std::string &arg) {
@@ -375,7 +385,12 @@ void GrokStream::net_session_() {
   uint8_t chunk[MIC_CHUNK];
   while (ok) {
     if (this->stop_requested_) {
-      reason = this->end_reason_.empty() ? "stopped" : this->end_reason_;
+      if (!this->end_reason_.empty()) {
+        reason = this->end_reason_;  // the bridge ended it (its audio-stop carried the reason)
+      } else {
+        std::lock_guard<std::mutex> lock(this->q_mutex_);
+        reason = this->stop_reason_req_.empty() ? "stopped" : this->stop_reason_req_;
+      }
       break;
     }
     bool did_work = false;
@@ -426,7 +441,13 @@ void GrokStream::net_session_() {
   }
 
   this->state_ = State::CLOSING;
-  this->send_event_("audio-stop", nullptr, nullptr, 0);  // best effort
+  {
+    // tell the bridge WHY the device ended the session (best effort)
+    std::string r;
+    for (char c : reason) r += (c == '"' || c == '\\' || (unsigned char) c < 0x20) ? '_' : c;
+    std::string js = "{\"reason\":\"" + r + "\"}";
+    this->send_event_("audio-stop", js.c_str(), nullptr, 0);
+  }
   ::shutdown(this->sock_, SHUT_RDWR);
   ::close(this->sock_);
   this->sock_ = -1;
