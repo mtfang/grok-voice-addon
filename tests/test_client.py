@@ -2,7 +2,8 @@
 Sends grok-hello, audio-start, then real-time PCM16 mono 16 kHz in 1024-byte audio-chunks (32 ms, like the
 firmware), keeps streaming silence like a live mic until the bridge sends grok-end / closes.
 Saves received 24 kHz audio to out_<name>.wav and reports latency (end of input speech -> first audio chunk).
-Usage: python test_client.py <host> <port> <name> <input.wav> [token]"""
+Usage: python test_client.py <host> <port> <name> <input.wav> [token]
+Env: BARGE_WAV/BARGE_AFTER_S (barge-in), NOISE_DBFS=-26 [NOISE_COLOR=white|pink] (constant mic noise floor)."""
 from __future__ import annotations
 import asyncio, json, sys, time, wave
 import numpy as np, soundfile as sf
@@ -52,9 +53,18 @@ async def main(host, port, name, wav_in, token=""):
     import os
     barge = os.environ.get("BARGE_WAV"); barge_after = float(os.environ.get("BARGE_AFTER_S", "1.5"))
     t0 = time.monotonic(); i = 0; CH = 1024
+    noise_db = os.environ.get("NOISE_DBFS"); noise_color = os.environ.get("NOISE_COLOR", "white")
+    noise_rms = 32768 * 10 ** (float(noise_db) / 20) if noise_db else 0.0   # emulate an AGC'd room noise floor
+    rng = np.random.default_rng(7)
     while not rtask.done() and time.monotonic() - t0 < 150:
         chunk = stream[i:i + CH] if i < len(stream) else b"\0" * CH
         chunk = chunk + b"\0" * (CH - len(chunk))
+        if noise_rms:
+            nz = rng.standard_normal(CH // 2)
+            if noise_color == "pink":
+                nz = np.cumsum(nz); nz -= np.convolve(nz, np.ones(64) / 64, mode="same"); nz /= nz.std() + 1e-9
+            mixed = np.frombuffer(chunk, np.int16).astype(np.float64) + nz * noise_rms
+            chunk = np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
         writer.write(encode_event("audio-chunk", FMT, chunk))
         i += CH
         if barge and "first_audio" in t and "barge_at" not in t and time.monotonic() - t["first_audio"] > barge_after:
