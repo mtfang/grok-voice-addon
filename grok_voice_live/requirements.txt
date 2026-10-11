@@ -1,0 +1,6 @@
+livekit-agents[xai,mcp]==1.8.6
+livekit-plugins-silero==1.8.6
+livekit==1.1.20
+mcp==1.30.0
+onnxruntime==1.31.0
+scipy==1.18.1

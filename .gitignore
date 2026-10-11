@@ -1,0 +1,5 @@
+tests/local/
+tests/results/
+__pycache__/
+*.pyc
+secrets.yaml
