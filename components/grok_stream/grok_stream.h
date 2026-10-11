@@ -40,6 +40,8 @@ class GrokStream : public Component {
   void set_speaker(speaker::Speaker *s) { this->speaker_ = s; }
   void set_idle_timeout(uint32_t ms) { this->idle_timeout_ms_ = ms; }
   void set_max_duration(uint32_t ms) { this->max_duration_ms_ = ms; }
+  // media player volume (0..1) at wake time, reported in the hello so the bridge can cap Grok's level
+  void set_device_volume(float v) { this->device_volume_ = v; }
 
   void start();
   void stop(const std::string &reason = "stopped");
@@ -106,6 +108,7 @@ class GrokStream : public Component {
   float lvl_db_[LVL_N]{};
   std::atomic<uint32_t> lvl_i_{0};
   float wake_rms_db_{-120.0f};
+  float device_volume_{-1.0f};
   uint32_t seg_count_{0};                  // audio-start events seen (main loop)
   uint32_t spk_seg_bytes_{0};              // bytes handed to the speaker in this reply (main loop)
   bool spk_idle_{true};                    // speaker ran dry / reply not started (main loop)

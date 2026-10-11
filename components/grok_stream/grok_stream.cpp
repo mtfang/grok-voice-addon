@@ -393,9 +393,10 @@ void GrokStream::net_session_() {
     this->post_("end", "connect_failed");
     return;
   }
-  char hello[224];
-  snprintf(hello, sizeof(hello), "{\"token\":\"%s\",\"device\":\"%s\",\"version\":2,\"wake_rms_db\":%.1f}",
-           this->token_.c_str(), this->device_name_.c_str(), this->wake_rms_db_);
+  char hello[256];
+  snprintf(hello, sizeof(hello),
+           "{\"token\":\"%s\",\"device\":\"%s\",\"version\":2,\"wake_rms_db\":%.1f,\"volume\":%.2f,\"mic_channel\":\"aec_ns_noagc\"}",
+           this->token_.c_str(), this->device_name_.c_str(), this->wake_rms_db_, this->device_volume_);
   const char *fmt = "{\"rate\":16000,\"width\":2,\"channels\":1}";
   bool ok = this->send_event_("grok-hello", hello, nullptr, 0) && this->send_event_("audio-start", fmt, nullptr, 0);
   ESP_LOGI(TAG, "connected to %s:%u, streaming", this->host_.c_str(), this->port_);

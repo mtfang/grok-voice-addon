@@ -316,6 +316,7 @@ micro_wake_word:
                                             condition:
                                               switch.is_on: grok_live_switch
                                             then:
+                                              - lambda: id(grok).set_device_volume(id(external_media_player).volume);
                                               - grok_stream.start: grok
                                             else:
                                               - delay: 300ms
@@ -513,7 +514,8 @@ grok_stream:
   token: ${grok_client_token}
   microphone:
     microphone: sat1_mics
-    channels: 0                 # XMOS AEC+IC+NS+AGC channel
+    channels: 1                 # XMOS ch1 = AEC+IC+NS without AGC (ch0's AGC pumps residual echo up)
+    gain_factor: 6              # fixed gain, like micro_wake_word on ch1; fine-tune with the add-on's input_gain_db
   speaker: grok_resampling_speaker
   idle_timeout: 30s             # no bytes from the add-on for 30 s (it pings every 5 s) -> hang up
   max_duration: 660s            # safety net only; the add-on decides (dismissal / idle_timeout_s / max_session_s 600)
