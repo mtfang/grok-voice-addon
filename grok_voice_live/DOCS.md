@@ -23,3 +23,12 @@ Port 10700/tcp is exposed on the host. The device opens a connection only after 
 - `output_rate` (default `48000`): the Satellite1 speaker pipeline (mixer, I2S, TAS2780) runs at 48 kHz, so the
   add-on resamples xAI's 24 kHz audio to 48 kHz with soxr (HIGH quality) and the device plays it without resampling.
 - On start the add-on logs read-only checks: xAI key valid, and HA MCP reachable (tool list).
+
+## Diagnostics
+
+- `log_level: debug`: per-second inbound (device mic) and outbound (to device) audio stats (bytes/s, frames/s,
+  RMS and peak dBFS), xAI server-VAD and transcription events, and realtime metrics. At `info` the add-on still logs
+  a per-session summary of inbound/outbound audio, the device's audio format and xAI transcripts.
+- `debug_dump_s` (0-60, default 0): write the first N seconds of raw inbound audio of each session to
+  `/share/grok_voice_live/inbound_<time>.wav` (reachable via the Samba / File editor add-ons).
+- `input_gain_db` (default 0): software gain on device mic audio before it is sent to xAI.

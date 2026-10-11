@@ -9,7 +9,8 @@ The bridge owns one LiveKit AgentSession (xAI realtime + HA MCP tools) per conne
 `idle_timeout_s` of silence or `max_session_s` total, so xAI is only billed while someone is talking.
 """
 from __future__ import annotations
-import asyncio, collections, hmac, logging, os, time
+import asyncio, collections, hmac, logging, math, os, time, wave
+import numpy as np
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, mcp
 from livekit.agents.voice import io
@@ -22,6 +23,47 @@ import settings
 log = logging.getLogger("grok-bridge")
 EQ_PRESET = ""  # loaded in main()
 OUT_RATE = 24000  # rate LiveKit hands us (xAI realtime output); we resample to the device rate ourselves
+
+
+class AudioStats:
+    """Per-direction counters for diagnostics: bytes/frames per second, RMS and peak (dBFS) of PCM16."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.total_bytes = self.total_frames = 0
+        self.total_sq = 0.0; self.total_n = 0; self.total_peak = 0
+        self._reset_window(); self.t_last = time.monotonic()
+
+    def _reset_window(self) -> None:
+        self.w_bytes = self.w_frames = 0; self.w_sq = 0.0; self.w_n = 0; self.w_peak = 0
+
+    def add(self, pcm: bytes) -> None:
+        x = np.frombuffer(pcm[: len(pcm) & ~1], dtype="<i2").astype(np.int64)
+        sq = float((x * x).sum()); pk = int(np.abs(x).max()) if x.size else 0
+        self.w_bytes += len(pcm); self.w_frames += 1; self.w_sq += sq; self.w_n += x.size; self.w_peak = max(self.w_peak, pk)
+        self.total_bytes += len(pcm); self.total_frames += 1; self.total_sq += sq; self.total_n += x.size
+        self.total_peak = max(self.total_peak, pk)
+
+    @staticmethod
+    def db(v: float) -> float:
+        return 20 * math.log10(v / 32768.0) if v > 0 else -120.0
+
+    def window_line(self) -> str | None:
+        """Returns a per-second summary line (and resets the window) once a second has elapsed."""
+        now = time.monotonic()
+        if now - self.t_last < 1.0:
+            return None
+        dt = now - self.t_last; self.t_last = now
+        rms = math.sqrt(self.w_sq / self.w_n) if self.w_n else 0.0
+        line = (f"{self.name}: {self.w_bytes / dt:.0f} B/s, {self.w_frames / dt:.1f} frames/s, "
+                f"rms {self.db(rms):.1f} dBFS, peak {self.db(self.w_peak):.1f} dBFS")
+        self._reset_window()
+        return line
+
+    def summary(self) -> str:
+        rms = math.sqrt(self.total_sq / self.total_n) if self.total_n else 0.0
+        return (f"{self.name}: {self.total_bytes} B in {self.total_frames} frames, rms {self.db(rms):.1f} dBFS, "
+                f"peak {self.db(self.total_peak):.1f} dBFS")
 
 
 class QueueAudioInput(io.AudioInput):
@@ -58,6 +100,8 @@ class DeviceAudioOutput(io.AudioOutput):
         self._eq = eq                                      # per-session state (one DeviceAudioOutput per session)
         self._rs: rtc.AudioResampler | None = None
         self._rs_in = 0
+        self.stats = AudioStats("out->device")
+        self.from_xai_bytes = 0
         self._q: collections.deque[bytes | None] = collections.deque()
         self._wake = asyncio.Event()
         self._seg_start: float | None = None
@@ -72,6 +116,7 @@ class DeviceAudioOutput(io.AudioOutput):
         if not self._in_segment:
             self._in_segment = True
             self._q.append(b"START")
+        self.from_xai_bytes += len(frame.data) * 2
         for pcm in self._convert(frame):
             self._q.append(pcm)
         self._wake.set()
@@ -161,6 +206,10 @@ class DeviceAudioOutput(io.AudioOutput):
         if self._sent_s == 0.0 and self._on_first_chunk:
             self._on_first_chunk()
         self._sent_s += len(pcm) / 2 / self.rate
+        self.stats.add(pcm)
+        line = self.stats.window_line()
+        if line:
+            log.debug(line)
         self._send("audio-chunk", self._fmt, pcm)
 
     async def aclose(self) -> None:
@@ -229,14 +278,39 @@ class Connection:
         t0 = time.monotonic()
         session, agent = build_session(o)
         inp = QueueAudioInput()
+        in_stats = AudioStats("in<-device")
+        in_fmt = {"rate": 16000, "width": 2, "channels": 1}
+        gain = 10 ** (float(o["input_gain_db"]) / 20.0)
+        dump = None
+        if int(o["debug_dump_s"]) > 0:
+            try:
+                os.makedirs(o["debug_dump_dir"], exist_ok=True)
+                path = os.path.join(o["debug_dump_dir"], time.strftime("inbound_%Y%m%d_%H%M%S.wav"))
+                dump = {"path": path, "w": wave.open(path, "wb"), "left": int(o["debug_dump_s"]) * 16000 * 2}
+                dump["w"].setnchannels(1); dump["w"].setsampwidth(2); dump["w"].setframerate(16000)
+                log.info("dumping first %ss of inbound audio (raw, before gain) to %s", o["debug_dump_s"], path)
+            except Exception as e:
+                log.warning("cannot open audio dump: %s", e); dump = None
         rate = int(o["output_rate"])
         eq = OutputEQ(EQ_PRESET, rate) if o["eq_enabled"] else None
         out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq)
         session.input.audio, session.output.audio = inp, out
 
+        @session.on("user_input_transcribed")
+        def _ut(ev):
+            log.info("xAI user transcript (final=%s): %s", getattr(ev, "is_final", "?"), getattr(ev, "transcript", ""))
+
+        @session.on("metrics_collected")
+        def _m(ev):
+            log.debug("metrics: %s", getattr(ev, "metrics", ev))
+
+        @session.on("error")
+        def _e(ev):
+            log.warning("session error: %r", getattr(ev, "error", ev))
+
         @session.on("user_state_changed")
         def _u(ev):
-            log.debug("user_state %s", ev.new_state)
+            log.info("user_state %s -> %s (xAI server VAD)", ev.old_state, ev.new_state)
             if ev.new_state == "away":
                 self.end("idle")
 
@@ -271,11 +345,28 @@ class Connection:
                     self.end("client_stop"); return
 
         def handle(ev) -> bool:
+            nonlocal dump
             etype, data, payload = ev
-            if etype == "audio-chunk" and payload:
+            if etype == "audio-start":
+                in_fmt.update({k: data[k] for k in ("rate", "width", "channels") if k in data})
+                log.info("device audio format: %s", in_fmt)
+            elif etype == "audio-chunk" and payload:
                 rate = int(data.get("rate", 16000)); ch = int(data.get("channels", 1))
                 if int(data.get("width", 2)) != 2 or len(payload) % (2 * ch):
+                    log.warning("dropping audio-chunk with unsupported format %s (%d B)", data, len(payload))
                     return True
+                in_stats.add(payload)
+                line = in_stats.window_line()
+                if line:
+                    log.debug(line)
+                if dump is not None:
+                    part = payload[: dump["left"]]
+                    dump["w"].writeframes(part); dump["left"] -= len(part)
+                    if dump["left"] <= 0:
+                        dump["w"].close(); log.info("audio dump written: %s", dump["path"]); dump = None
+                if gain != 1.0:
+                    x = np.frombuffer(payload, dtype="<i2").astype(np.float32) * gain
+                    payload = np.clip(x, -32768, 32767).astype("<i2").tobytes()
                 n = len(payload) // (2 * ch)
                 fr = rtc.AudioFrame(payload, rate, ch, n)
                 inp.push(fr)
@@ -311,6 +402,16 @@ class Connection:
         try:
             await session.start(agent)
             log.info("xAI session ready in %.2fs", time.monotonic() - t0)
+            rt = getattr(getattr(session, "_activity", None), "realtime_llm_session", None)
+            if rt is not None:
+                rt.on("input_speech_started", lambda ev: log.info("xAI: input_audio_buffer.speech_started"))
+                rt.on("input_speech_stopped", lambda ev: log.info("xAI: input_audio_buffer.speech_stopped"))
+                rt.on("input_audio_transcription_completed",
+                      lambda ev: log.info("xAI: input transcription: %s", getattr(ev, "transcript", "")))
+                rt.on("generation_created", lambda ev: log.debug("xAI: response generation created"))
+                rt.on("error", lambda ev: log.warning("xAI error: %r", getattr(ev, "error", ev)))
+            else:
+                log.debug("realtime session handle not available for event hooks")
             try:
                 await asyncio.wait_for(self.ended.wait(), timeout=float(o["max_session_s"]))
             except asyncio.TimeoutError:
@@ -329,6 +430,13 @@ class Connection:
             except Exception:
                 pass
             await out.aclose()
+            if dump is not None:
+                try:
+                    dump["w"].close(); log.info("audio dump written (session ended early): %s", dump["path"])
+                except Exception:
+                    pass
+            log.info("%s; format %s; input gain %+.1f dB", in_stats.summary(), in_fmt, float(o["input_gain_db"]))
+            log.info("%s; audio from xAI %d B (24 kHz)", out.stats.summary(), out.from_xai_bytes)
             if eq is not None and (eq.limited_blocks or eq.clipped_samples):
                 log.info("EQ limiter engaged on %d ms of audio, %d samples hard-clipped",
                          eq.limited_blocks * 1000 * eq.block // rate, eq.clipped_samples)
@@ -376,6 +484,8 @@ async def main() -> None:
     logging.basicConfig(level=getattr(logging, opts["log_level"].upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("livekit.agents").setLevel(os.environ.get("LIVEKIT_LOG_LEVEL", "WARNING"))
+    for noisy in ("httpx", "httpcore", "websockets", "asyncio", "mcp", "aiohttp"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("livekit.plugins.openai").setLevel(os.environ.get("LIVEKIT_LOG_LEVEL", "WARNING"))
     log.info("options: %s", settings.redacted(opts))
     global EQ_PRESET
