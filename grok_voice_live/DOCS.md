@@ -8,7 +8,7 @@ Options:
 - `ha_token`: long-lived token of the non-admin `grok-voice` HA user (MCP tools see only Assist-exposed entities).
 - `ha_url`: default `http://homeassistant:8123` (Core on the internal Supervisor network).
 - `client_token`: shared secret; must match `grok_client_token` in the device YAML. Strongly recommended.
-- `allowed_clients`: optional list of device IPs allowed to connect (e.g. `192.168.200.157`).
+- `allowed_clients`: optional list of device IPs allowed to connect (e.g. `<satellite-ip>`).
 - `idle_timeout_s` / `max_session_s`: hang up after this much silence / this long in total (billing control).
 - `local_vad_barge_in`: Silero VAD on the bridge for fast barge-in (~0.3 s instead of ~0.85 s).
 
