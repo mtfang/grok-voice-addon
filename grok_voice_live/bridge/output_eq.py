@@ -53,9 +53,12 @@ class OutputEQ:
     """Stateful EQ + limiter for PCM16 mono. process() takes and returns int16 PCM bytes."""
 
     def __init__(self, preset_text: str, fs: int, ceiling_db: float = -1.0,
-                 release_ms: float = 80.0, block_ms: float = 1.0) -> None:
+                 release_ms: float = 80.0, block_ms: float = 1.0, preamp_db: float | None = None) -> None:
         self.fs = fs
         self.preamp_db, self.filters = parse_apo(preset_text)
+        if preamp_db is not None:          # override the preset's preamp (flat gain: same curve shape)
+            self.preamp_db = float(preamp_db)
+        self.ceiling_db = ceiling_db
         self.sos = np.vstack([rbj_biquad(k, f, g, q, fs) for k, f, g, q in self.filters])
         self.pre = 10 ** (self.preamp_db / 20.0)
         self.zi = sosfilt_zi(self.sos) * 0.0          # start from silence

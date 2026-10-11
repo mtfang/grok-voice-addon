@@ -142,6 +142,7 @@ class DeviceAudioOutput(io.AudioOutput):
         self.seg_pos = 0                                   # samples of the current reply sent so far
         self.seg_chunks: list[tuple[int, float]] = []      # (reply sample pos, t_play) of this reply's chunks
         self.ref_shift = 0.0                               # correction from the device's grok-played markers
+        self._mk_seg, self._mk = -1, []                    # marker smoothing (see device_played)
         self._task = asyncio.ensure_future(self._pump())
 
     def env_db(self, t0: float, t1: float) -> float:
@@ -156,7 +157,21 @@ class DeviceAudioOutput(io.AudioOutput):
         p0, t0 = max(((p, t) for p, t in self.seg_chunks if p <= pos), default=self.seg_chunks[0])
         t_est = t0 + (pos - p0) / self.rate
         delta = t_true - t_est
-        if abs(delta) < 0.002 or abs(delta) > 1.0:
+        if abs(delta) > 1.0:
+            return delta
+        # The real device sends a marker after every short speaker idle (every ~40 ms during a reply), each
+        # with +-60 ms of timing jitter. Applying each one would shake the echo reference around: use the
+        # first marker of a reply as is, then only move on a consistent offset (median of the last 7).
+        if self._mk_seg != seg:
+            self._mk_seg, self._mk = seg, []
+        else:
+            self._mk.append(delta)
+            if len(self._mk) < 7:
+                return None
+            delta = float(np.median(self._mk)); self._mk = []
+            if abs(delta) < 0.010:
+                return delta
+        if abs(delta) < 0.002:
             return delta
         self.ref_shift += delta
         self.seg_chunks = [(p, t + delta) if p >= p0 else (p, t) for p, t in self.seg_chunks]
@@ -196,6 +211,8 @@ class DeviceAudioOutput(io.AudioOutput):
         for f in frames:
             pcm = bytes(f.data)
             if pcm:
+                if self._eq is None and getattr(self, "gain", 1.0) < 1.0:
+                    pcm = (np.frombuffer(pcm, "<i2").astype(np.float32) * self.gain).astype("<i2").tobytes()
                 out.append(self._eq.process(pcm) if self._eq else pcm)
         return out
 
@@ -375,6 +392,7 @@ class EchoModel:
         self.frames = 0
         self.fits = 0
         self.corr = 0.0
+        self.peak = -40.0                # loudest fitted coupling (how loud the speaker has been), see barge-in
 
     def out_at(self, t: float) -> float:
         # chunk with play time tp covers [tp, tp + 40 ms]; widen by one frame for timing slop
@@ -435,13 +453,57 @@ class EchoModel:
         c = float(np.median(e))
         self.coupling = min(15.0, max(-40.0, c if self.fits == 0 else 0.5 * self.coupling + 0.5 * c))
         self.fits += 1
+        self.peak = max(self.peak, self.coupling)
         log.debug("echo model fit: lag %.0f ms, coupling %+.1f dB (corr %.2f, %d frames)",
                   self.lag * 1000, self.coupling, best, int(m.sum()))
 
 
 ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # device -> (lag s, coupling dB, noise floor dBFS)
 ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # device -> canceller (learned echo path survives sessions)
-ACTIVE: dict[str, asyncio.Task] = {}                      # device -> its running session task
+ACTIVE: dict[str, asyncio.Task] = {}
+ECHO_PEAK: dict[str, float] = {}                          # device -> loudest echo coupling seen (dB)                      # device -> its running session task
+
+
+class WakeArbiter:
+    """Several Satellites hearing the same "Hey Grok" (open floor plan) must not all answer. The first hello
+    opens a short window; every device that wakes within it joins the group, and when the window closes the
+    best one (loudest wake word at its mic, i.e. probably the closest; ties/missing -> first arrival) keeps its
+    session and the others get a clean `grok-stand-down`. A wake after the window is an independent session."""
+
+    def __init__(self) -> None:
+        self.group: dict | None = None
+
+    async def claim(self, conn: "Connection", score: float | None, window: float) -> tuple[bool, str]:
+        loop = asyncio.get_running_loop()
+        now = time.monotonic()
+        g = self.group
+        if g is None or now - g["t0"] > window:
+            g = self.group = {"t0": now, "members": [], "done": loop.create_future(), "winner": None}
+            loop.call_later(window, self._decide, g)
+        if g["done"].done():
+            return False, "late"
+        g["members"].append((conn, score, len(g["members"]), now))
+        await asyncio.shield(g["done"])
+        if len(g["members"]) > 1:
+            desc = ", ".join(f"{c.device} {'%.1f dBFS' % s if s is not None else 'n/a'} +{(t - g['t0']) * 1000:.0f} ms"
+                             for c, s, _, t in g["members"])
+        else:
+            desc = ""
+        return g["winner"] is conn, desc
+
+    def _decide(self, g: dict) -> None:
+        ms = g["members"]
+        scored = [m for m in ms if m[1] is not None]
+        if len(scored) == len(ms) and ms:
+            best = max(ms, key=lambda m: (m[1], -m[2]))       # loudest wake, earliest on a tie
+        else:
+            best = min(ms, key=lambda m: m[2]) if ms else None # fall back to first arrival
+        g["winner"] = best[0] if best else None
+        if not g["done"].done():
+            g["done"].set_result(True)
+
+
+ARBITER = WakeArbiter()
 
 
 class Connection:
@@ -480,6 +542,24 @@ class Connection:
         import re as _re
         self.device = _re.sub(r"[^A-Za-z0-9_.-]", "_", str(first[1].get("device") or self.peer))[:64]
         DEVICE.set(self.device)
+        win = float(o["arbitration_window_ms"]) / 1000.0
+        if win > 0:
+            sc = first[1].get("wake_rms_db")
+            try:
+                sc = float(sc) if sc is not None else None
+            except (TypeError, ValueError):
+                sc = None
+            won, desc = await ARBITER.claim(self, sc, win)
+            if desc:
+                log.info("wake arbitration (%s): %s", desc, "this device answers" if won else "standing down")
+            if not won:
+                self.send("grok-stand-down", {"reason": "other_device"})
+                try:
+                    await asyncio.wait_for(self.writer.drain(), 2)
+                except Exception:
+                    pass
+                self.end_reason = "stand_down"
+                return
         # one session per device: a new wake from the same device replaces its old session; other devices'
         # sessions are untouched (state below is keyed by device name, not by a single global)
         old = ACTIVE.get(self.device)
@@ -537,7 +617,8 @@ class Connection:
             except Exception as e:
                 log.warning("cannot open audio dump: %s", e); dump = None
         rate = int(o["output_rate"])
-        eq = OutputEQ(EQ_PRESET, rate) if o["eq_enabled"] else None
+        eq = (OutputEQ(EQ_PRESET, rate, ceiling_db=float(o["eq_ceiling_db"]), preamp_db=o["eq_preamp_db"])
+              if o["eq_enabled"] else None)
         ec = None
         if o["echo_cancel"]:
             ec = ECHO_CANCELLERS.get(self.device)
@@ -546,10 +627,25 @@ class Connection:
             ec.new_session()
             if os.environ.get("GROK_EC_DEBUG"):
                 ec.debug = []
+        # keep the speaker linear at high volume: Grok plays at most `playback_volume_cap` of full volume
+        # (the device reports its media player volume in the hello; the cap is applied digitally)
+        vol = first[1].get("volume")
+        try:
+            vol = float(vol) if vol is not None else -1.0
+        except (TypeError, ValueError):
+            vol = -1.0
+        cap = float(o["playback_volume_cap"])
+        out_gain = min(1.0, cap / vol) if (vol > 0 and cap > 0) else 1.0
+        if out_gain < 1.0:
+            log.info("device volume %.2f > cap %.2f: Grok's audio %.1f dB", vol, cap, 20 * math.log10(out_gain))
+        if eq is not None:
+            eq.pre *= out_gain
         out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq, ec=ec)
+        out.gain = out_gain
         session.input.audio, session.output.audio = inp, out
         lag0, coup0, noise0 = ECHO_STATE.get(self.device, (0.15, float(o["barge_echo_init_db"]), -30.0))
         em = EchoModel(out, lag0, coup0, noise0)
+        em.peak = ECHO_PEAK.get(self.device, -40.0) - 2.0   # last session's loudness, decayed a little
 
         @session.on("user_input_transcribed")
         def _ut(ev):
@@ -692,8 +788,9 @@ class Connection:
                 if ec is not None and ec.Tm0 is not None:
                     t_true = ec.Tm0 + int(data.get("mic", 0)) / 16000.0
                     d = out.device_played(int(data.get("seg", -1)), int(data.get("pos", 0)), t_true)
-                    log.debug("device playback marker seg %s pos %s: reference shifted %s ms", data.get("seg"),
-                              data.get("pos"), "n/a" if d is None else f"{d * 1000:+.0f}")
+                    if d is not None and abs(d) >= 0.002:
+                        log.debug("device playback marker seg %s pos %s: reference shifted %+.0f ms", data.get("seg"),
+                                  data.get("pos"), d * 1000)
             elif etype == "audio-stop":
                 self.device_stop_reason = str((data or {}).get("reason") or "unspecified")[:40]
                 return False
@@ -764,6 +861,20 @@ class Connection:
                 # the first ~0.8 s of each reply: the echo delay jumps by tens of ms between replies, so until the
                 # canceller has re-locked (and the XMOS AEC re-converged) residual echo is higher: be stricter
                 m_eff = margin + (float(o["barge_onset_extra_db"]) if now - out.seg_t0 < float(o["barge_onset_s"]) else 0.0)
+                # loud playback (high volume: speaker/amp nonlinear, residual echo the linear canceller can't
+                # remove): the closer the measured echo coupling gets to 0 dB, the stricter the barge-in.
+                # Real interruptions on the device: 78-100% of frames, 8-15 dB over echo; self ones 44-67%, 4-5 dB.
+                hv_lo, hv_hi = float(o["barge_hv_from_db"]), float(o["barge_hv_full_db"])
+                # The coupling estimate decays toward -15 dB whenever the canceller removes the linear echo,
+                # so use the loudest coupling fitted so far (this session or the device's last one), and be
+                # fully strict at the start of each reply until the echo model has re-fitted on it.
+                if echo.get("seg_seen") != out.seg_t0:
+                    echo["seg_seen"] = out.seg_t0; echo["seg_fits0"] = em.fits
+                converged = em.fits > echo["seg_fits0"] or now - out.seg_t0 > float(o["barge_strict_until_s"])
+                hv = 1.0 if not converged else min(1.0, max(0.0, (max(em.coupling, em.peak) - hv_lo)
+                                                            / max(0.1, hv_hi - hv_lo)))
+                echo["hv"] = hv
+                m_eff += hv * max(0.0, float(o["barge_hv_margin_db"]) - margin)
                 if ec is not None:
                     # double-talk (barge-in confirmed while Grok's audio is still in the air): don't let the echo
                     # filter adapt on the user's voice, it would distort it. Not before the barge-in is confirmed:
@@ -790,7 +901,10 @@ class Connection:
                 frac = sum(1 for x in win if x[1] >= x[2]) / len(win)
                 # user speech fills the syllable gaps of Grok's echo: require enough frames well above the
                 # predicted echo, not just a louder average
-                if frac < float(o["barge_frac"]):
+                hv = echo.get("hv", 0.0)
+                frac0 = max(float(o["barge_frac"]), float(o["barge_frac_floor"]))   # floor while Grok plays
+                frac_req = frac0 + hv * max(0.0, float(o["barge_hv_frac"]) - frac0)
+                if frac < frac_req or med_ex < hv * float(o["barge_hv_margin_db"]):
                     continue
                 if tool_busy():
                     log.debug("barge-in suppressed: tool call / tool reply / hang-up pending")
@@ -869,6 +983,7 @@ class Connection:
         finally:
             rtask.cancel(); ktask.cancel(); wtask.cancel()
             ECHO_STATE[self.device] = (em.lag, em.coupling, em.noise)
+            ECHO_PEAK[self.device] = em.peak
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -898,7 +1013,7 @@ class Connection:
             log.info("echo: lag %.0f ms, coupling %+.1f dB (fits %d, corr %.2f), noise floor %.1f dBFS; barge-ins %d, "
                      "echo candidates rejected %d (worst: %.0f%% of frames above echo+%.1f dB; needs %.0f%%)",
                      em.lag * 1000, em.coupling, em.fits, em.corr, em.noise, echo["fired"], echo["rejected"],
-                     100 * max(0.0, echo["max_rej"]), margin, 100 * float(o["barge_frac"]))
+                     100 * max(0.0, echo["max_rej"]), margin, 100 * max(float(o["barge_frac"]), float(o["barge_frac_floor"])))
             log.info("%s; audio from xAI %d B (24 kHz)", out.stats.summary(), out.from_xai_bytes)
             if eq is not None and (eq.limited_blocks or eq.clipped_samples):
                 log.info("EQ limiter engaged on %d ms of audio, %d samples hard-clipped",
@@ -936,6 +1051,12 @@ async def startup_checks(opts: dict) -> None:
                 tools = await asyncio.wait_for(cs.list_tools(), 15)
                 log.info("startup check HA MCP (%s): OK, %d tools: %s", url, len(tools.tools),
                          ", ".join(t.name for t in tools.tools)[:400])
+                import re as _re
+                pat = _re.compile(opts["hidden_tool_pattern"], _re.I) if opts["hidden_tool_pattern"] else None
+                hid = [t.name for t in tools.tools if t.name in set(opts["hidden_tools"]) or (pat and pat.search(t.name))]
+                log.info("live agent tools: HA (home only) %d, hidden from the agent: %s; xAI server tools: %s",
+                         len(tools.tools) - len(hid), ", ".join(hid) or "none",
+                         ", ".join(n for n in ("web_search", "x_search") if opts[n]) or "none")
     except BaseException as e:  # noqa: BLE001 (anyio ExceptionGroup)
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
@@ -959,9 +1080,10 @@ async def main() -> None:
     with open(preset) as f:
         EQ_PRESET = f.read()
     if opts["eq_enabled"]:
-        e = OutputEQ(EQ_PRESET, int(opts["output_rate"]))
-        log.info("output EQ on @ %d Hz: preamp %+.1f dB, %s; limiter ceiling -1 dBFS", e.fs, e.preamp_db,
-                 ", ".join(f"{k} {fc:g}Hz {g:+g}dB Q{q:g}" for k, fc, g, q in e.filters))
+        e = OutputEQ(EQ_PRESET, int(opts["output_rate"]), ceiling_db=float(opts["eq_ceiling_db"]),
+                     preamp_db=opts["eq_preamp_db"])
+        log.info("output EQ on @ %d Hz: preamp %+.1f dB, %s; limiter ceiling %.1f dBFS", e.fs, e.preamp_db,
+                 ", ".join(f"{k} {fc:g}Hz {g:+g}dB Q{q:g}" for k, fc, g, q in e.filters), e.ceiling_db)
     else:
         log.info("output EQ off; output %d Hz", int(opts["output_rate"]))
     if opts["startup_checks"]:

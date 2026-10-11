@@ -10,7 +10,7 @@ DEFAULTS = {
     "xai_api_key": "", "xai_api_key_file": "",
     "model": "grok-voice-latest",
     "voice": "sirius",
-    "idle_timeout_s": 75,        # hang up after this long with nobody talking (never during tool calls)
+    "idle_timeout_s": 10,        # hang up after this long of true silence after Grok finishes (never during tool calls)
     "max_session_s": 600,
     "client_token": "",
     "allowed_clients": [],
@@ -24,7 +24,17 @@ DEFAULTS = {
     "vad_gate": True,            # send xAI silence while local Silero VAD hears no speech (noisy AGC'd mic)
     "vad_gate_preroll_ms": 600,
     "tool_reply_protect_s": 2.5, # no barge-in during the first seconds of a spoken tool result
-    "barge_onset_s": 1.2,        # stricter barge-in margin for the first part of each reply (echo path re-locking)
+    "barge_onset_s": 1.2,
+    "barge_frac_floor": 0.5,     # min fraction of frames above echo+margin while Grok's audio plays
+    "barge_strict_until_s": 0.0, # strict at the start of each reply until the echo model re-fits (cap)
+    "barge_hv_from_db": -6.0,    # echo coupling where the loud-playback strictness starts ...
+    "barge_hv_full_db": -3.0,    # ... and where it is fully on
+    "barge_hv_frac": 0.6,        # at full strictness: fraction of frames above echo+margin
+    "barge_hv_margin_db": 6.0,   # at full strictness: margin and median excess over the predicted echo
+    "eq_preamp_db": 2.0,         # EQ preamp (FPH preset says +5 dB; less drive = less speaker distortion)
+    "eq_ceiling_db": -3.0,       # output limiter ceiling        # stricter barge-in margin for the first part of each reply (echo path re-locking)
+    "playback_volume_cap": 0.7,  # Grok plays at most this fraction of full volume (speaker stays linear; 0 = off)
+    "arbitration_window_ms": 350,  # several Satellites woken by one "Hey Grok": only the loudest answers (0 = off)
     "web_search": True,          # xAI built-in web search tool in the realtime session
     "x_search": True,            # xAI built-in X (Twitter) search
     # Architecture rule: non-home capabilities come from xAI's own tools; HA MCP tools are only for the home.
