@@ -94,6 +94,17 @@ class GrokStream : public Component {
   size_t pending_off_{0};
   uint32_t last_rx_ms_{0};
   std::string end_reason_;  // net task only
+
+  // playback-start markers ("grok-played"): when reply audio starts entering the speaker after an idle speaker,
+  // report which reply sample it was and how many mic samples had been captured at that moment, so the bridge
+  // can align its echo reference with the mic stream exactly (no wall-clock guessing).
+  std::atomic<uint32_t> mic_written_{0};   // mic bytes captured this session (mic task)
+  uint32_t seg_count_{0};                  // audio-start events seen (main loop)
+  uint32_t spk_seg_bytes_{0};              // bytes handed to the speaker in this reply (main loop)
+  bool spk_idle_{true};                    // speaker ran dry / reply not started (main loop)
+  std::mutex marker_mutex_;
+  bool marker_ready_{false};
+  uint32_t marker_seg_{0}, marker_pos_{0}, marker_mic_{0};
   HighFrequencyLoopRequester high_freq_;
 
   Trigger<> start_trigger_;

@@ -68,6 +68,7 @@ void GrokStream::setup() {
   this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
     if (this->state_.load() == State::ACTIVE) {
       this->mic_rb_->write(data.data(), data.size());  // overwrites oldest if the network stalls
+      this->mic_written_ += data.size();
     }
   });
   // Persistent network task (avoids per-session task create/delete); waits for a start notification.
@@ -93,6 +94,13 @@ void GrokStream::start() {
   this->stop_requested_ = false;
   this->mic_rb_->reset();
   this->spk_rb_->reset();
+  this->mic_written_ = 0;
+  this->seg_count_ = 0;
+  this->spk_idle_ = true;
+  {
+    std::lock_guard<std::mutex> lock(this->marker_mutex_);
+    this->marker_ready_ = false;
+  }
   xTaskNotifyGive(this->net_task_handle_);
 }
 
@@ -122,8 +130,12 @@ void GrokStream::loop() {
     } else if (k == "audio-start") {
       this->out_rate_ = std::max(8000L, std::min(48000L, atol(ev.second.c_str())));
       this->want_speaker_ = true;
+      this->seg_count_++;
+      this->spk_seg_bytes_ = 0;
+      this->spk_idle_ = true;
     } else if (k == "clear") {
       this->pending_len_ = 0;
+      this->spk_idle_ = true;
       if (this->speaker_active_) {
         this->speaker_->stop();  // drops audio already queued downstream (resampler/mixer)
         this->speaker_active_ = false;
@@ -156,9 +168,22 @@ void GrokStream::loop() {
       if (this->pending_len_ == 0) {
         this->pending_len_ = this->spk_rb_->read(this->spk_tmp_, sizeof(this->spk_tmp_), 0) & ~size_t(1);
         this->pending_off_ = 0;
-        if (this->pending_len_ == 0) break;
+        if (this->pending_len_ == 0) {
+          this->spk_idle_ = true;
+          break;
+        }
       }
+      uint32_t mic_now = this->mic_written_.load();
       size_t n = this->speaker_->play(this->spk_tmp_ + this->pending_off_, this->pending_len_, 0);
+      if (n > 0 && this->spk_idle_) {
+        std::lock_guard<std::mutex> lock(this->marker_mutex_);
+        this->marker_seg_ = this->seg_count_;
+        this->marker_pos_ = this->spk_seg_bytes_ / 2;  // reply sample index (PCM16 mono at out_rate)
+        this->marker_mic_ = mic_now / 2;               // mic sample index (PCM16 mono 16 kHz)
+        this->marker_ready_ = true;
+        this->spk_idle_ = false;
+      }
+      this->spk_seg_bytes_ += n;
       this->pending_off_ += n;
       this->pending_len_ -= n;
       if (this->pending_len_ > 0) break;  // speaker buffer full, retry next loop
@@ -354,6 +379,23 @@ void GrokStream::net_session_() {
       break;
     }
     bool did_work = false;
+    {
+      char mk[96];
+      bool send_mk = false;
+      {
+        std::lock_guard<std::mutex> lock(this->marker_mutex_);
+        if (this->marker_ready_) {
+          snprintf(mk, sizeof(mk), "{\"seg\":%u,\"pos\":%u,\"mic\":%u}", (unsigned) this->marker_seg_,
+                   (unsigned) this->marker_pos_, (unsigned) this->marker_mic_);
+          this->marker_ready_ = false;
+          send_mk = true;
+        }
+      }
+      if (send_mk && !this->send_event_("grok-played", mk, nullptr, 0)) {
+        reason = "send_failed";
+        break;
+      }
+    }
     while (this->mic_rb_->available() >= MIC_CHUNK) {
       this->mic_rb_->read(chunk, MIC_CHUNK, 0);
       if (!this->send_event_("audio-chunk", fmt, chunk, MIC_CHUNK)) {
