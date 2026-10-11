@@ -443,10 +443,10 @@ select:
       - Very sensitive
     on_value:
       lambda: |-
-        // hey_grok (microwakeword.com model 1474, manifest cutoff 0.5): untuned, adjust after real-room testing
-        if (x == "Slightly sensitive") id(hey_grok).set_probability_cutoff(128);
-        else if (x == "Moderately sensitive") id(hey_grok).set_probability_cutoff(110);
-        else if (x == "Very sensitive") id(hey_grok).set_probability_cutoff(92);
+        // hey_grok (microwakeword.com model 1474): Moderately = manifest cutoff 0.5 (same as the previous firmware)
+        if (x == "Slightly sensitive") id(hey_grok).set_probability_cutoff(153);
+        else if (x == "Moderately sensitive") id(hey_grok).set_probability_cutoff(128);
+        else if (x == "Very sensitive") id(hey_grok).set_probability_cutoff(102);
         if (x == "Slightly sensitive") {
           id(okay_nabu).set_probability_cutoff(217);
           id(hey_jarvis).set_probability_cutoff(247);
