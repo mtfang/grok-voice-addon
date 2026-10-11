@@ -9,7 +9,7 @@ Env: BARGE_WAV/BARGE_AFTER_S/BARGE_GAIN_DB (barge-in), NOISE_DBFS=-26 [NOISE_COL
      flushes it like the device does), MAX_S (stop after N s), NEXT_WAV/NEXT_AFTER_IDLE_S (say a second
      utterance N s after the bridge's audio stops, e.g. "thanks, that's all")."""
 from __future__ import annotations
-import asyncio, json, sys, time, wave
+import asyncio, json, os, sys, time, wave
 import numpy as np, soundfile as sf
 sys.path.insert(0, __file__.rsplit("/tests/", 1)[0] + "/grok_voice_live/bridge")
 from protocol import read_event, encode_event
@@ -30,7 +30,8 @@ async def main(host, port, name, wav_in, token=""):
     speech_end = len(stream)
     t_connect = time.monotonic()
     reader, writer = await asyncio.open_connection(host, int(port))
-    writer.write(encode_event("grok-hello", {"token": token, "device": "test-emulator", "version": 1}))
+    writer.write(encode_event("grok-hello", dict({"token": token, "device": __import__("os").environ.get("DEVICE", "test-emulator"), "version": 2},
+        **({"wake_rms_db": float(__import__("os").environ["WAKE_RMS"])} if __import__("os").environ.get("WAKE_RMS") else {}))))
     writer.write(encode_event("audio-start", FMT)); await writer.drain()
     out, events, t = bytearray(), [], {}
 
@@ -52,17 +53,21 @@ async def main(host, port, name, wav_in, token=""):
             else:
                 if et == "grok-clear":
                     play.clear()
+                if et == "audio-start":
+                    spk["seg"] += 1; spk["pos"] = 0
                 if et == "audio-start" and data:
                     t["out_rate"] = int(data.get("rate", 24000))
                 events.append({"t": round(now - t_connect, 3), "type": et, "data": data})
                 print(f"  +{now - t_connect:6.2f}s {et} {json.dumps(data) if data else ''}", flush=True)
-                if et == "grok-end":
-                    t.setdefault("closed", now); return
+                if et in ("grok-end", "grok-stand-down"):
+                    t.setdefault("closed", now); t["stood_down"] = et == "grok-stand-down"; return
 
     import os, collections
     echo_db = os.environ.get("ECHO_DB"); echo_g = 10 ** (float(echo_db) / 20) if echo_db else 0.0
     delay = np.zeros(int(16 * float(os.environ.get("ECHO_DELAY_MS", "120"))))
     play: collections.deque = collections.deque()
+    spk = {"seg": 0, "pos": 0, "idle": True}          # like the firmware: report playback start (grok-played)
+    markers = os.environ.get("MARKERS", "1") == "1"
     max_s = float(os.environ.get("MAX_S", "150"))
     nxt = os.environ.get("NEXT_WAV"); nxt_idle = float(os.environ.get("NEXT_AFTER_IDLE_S", "1.5"))
     rtask = asyncio.ensure_future(rx())
@@ -81,9 +86,20 @@ async def main(host, port, name, wav_in, token=""):
             mixed = np.frombuffer(chunk, np.int16).astype(np.float64) + nz * noise_rms
             chunk = np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
         if echo_g:
-            spk = np.array([play.popleft() if play else 0.0 for _ in range(CH // 2)])
-            dl = np.concatenate([delay, spk]); delay, e = dl[len(spk):], dl[:len(spk)]
-            mixed = np.frombuffer(chunk, np.int16).astype(np.float64) + e * echo_g
+            got = min(len(play), CH // 2)
+            jit = float(os.environ.get("MARKER_JITTER_MS", "0"))
+            if got and markers and (spk["idle"] or jit > 0):   # jitter mode: a marker every chunk, like the device
+                mic = i // 2 + (int(np.random.uniform(-jit, jit) * 16) if jit > 0 else 0)
+                writer.write(encode_event("grok-played", {"seg": spk["seg"], "pos": spk["pos"] * 3, "mic": max(0, mic)}))
+            spk["idle"] = got == 0
+            spk["pos"] += got
+            sp = np.array([play.popleft() if play else 0.0 for _ in range(CH // 2)])
+            dl = np.concatenate([delay, sp]); delay, e = dl[len(sp):], dl[:len(sp)]
+            ee = e * echo_g
+            if os.environ.get("ECHO_CLIP_DBFS"):    # loud speaker: soft-clipping (nonlinear) echo path
+                lim = 32768 * 10 ** (float(os.environ["ECHO_CLIP_DBFS"]) / 20)
+                ee = lim * np.tanh(ee / lim)
+            mixed = np.frombuffer(chunk, np.int16).astype(np.float64) + ee
             chunk = np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
         writer.write(encode_event("audio-chunk", FMT, chunk))
         i += CH
@@ -117,6 +133,7 @@ async def main(host, port, name, wav_in, token=""):
            "self_interrupts": sum(1 for e in events if e["type"] == "grok-clear" and ("barge_at" not in t or e["t"] < t["barge_at"] - t_connect)),
            "end_after_next_s": round(t["closed"] - t["next_at"], 2) if "next_at" in t and "closed" in t else None,
            "end": next((e["data"] for e in events if e["type"] == "grok-end"), None),
+           "stood_down": t.get("stood_down", False),
            "transcript": [e["data"] for e in events if e["type"] == "transcript"]}
     json.dump({**res, "events": events}, open(f"{name}.json", "w"), indent=1)
     print(json.dumps(res, indent=1))

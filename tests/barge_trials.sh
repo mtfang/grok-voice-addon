@@ -7,7 +7,7 @@ P=/workspace/grok-voice-agent/.venv/bin/python; A=/workspace/grok-voice-agent/te
 label=$1; bw=$2; gain=$3; n=$4; edb=${5:-2}
 for i in $(seq 1 $n); do
   after=$(python3 -c "import random;print(round(random.uniform(3,7),1))")
-  ECHO_DB=$edb NOISE_DBFS=-28 NOISE_COLOR=pink BARGE_WAV=$bw BARGE_GAIN_DB=$gain BARGE_AFTER_S=$after MAX_S=18 \
+  ECHO_DB=$edb ECHO_CLIP_DBFS=${ECHO_CLIP_DBFS:-} NOISE_DBFS=-28 NOISE_COLOR=pink BARGE_WAV=$bw BARGE_GAIN_DB=$gain BARGE_AFTER_S=$after MAX_S=${MAX_S:-18} \
     timeout 40 $P ../test_client.py 127.0.0.1 10700 trial_${label}_$i $A/cmd_long.wav "$TOK" > /tmp/trial_${label}_$i.out 2>&1
   python3 - "$label" "$i" <<'PY'
 import json,sys
