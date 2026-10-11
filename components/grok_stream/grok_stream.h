@@ -100,6 +100,12 @@ class GrokStream : public Component {
   // report which reply sample it was and how many mic samples had been captured at that moment, so the bridge
   // can align its echo reference with the mic stream exactly (no wall-clock guessing).
   std::atomic<uint32_t> mic_written_{0};   // mic bytes captured this session (mic task)
+  // Wake arbitration: mic level of the last ~2 s (per-callback block RMS, dBFS), so the hello can tell the
+  // bridge how loud "Hey Grok" was here; the bridge picks the closest Satellite when several wake at once.
+  static constexpr size_t LVL_N = 64;
+  float lvl_db_[LVL_N]{};
+  std::atomic<uint32_t> lvl_i_{0};
+  float wake_rms_db_{-120.0f};
   uint32_t seg_count_{0};                  // audio-start events seen (main loop)
   uint32_t spk_seg_bytes_{0};              // bytes handed to the speaker in this reply (main loop)
   bool spk_idle_{true};                    // speaker ran dry / reply not started (main loop)

@@ -1,4 +1,6 @@
 #include "grok_stream.h"
+#include <cmath>
+#include <algorithm>
 
 #ifdef USE_ESP32
 
@@ -69,6 +71,16 @@ void GrokStream::setup() {
     if (this->state_.load() == State::ACTIVE) {
       this->mic_rb_->write(data.data(), data.size());  // overwrites oldest if the network stalls
       this->mic_written_ += data.size();
+    } else if (data.size() >= 2) {
+      // idle: keep a short history of mic level (for the wake-arbitration score in the hello)
+      const int16_t *x = reinterpret_cast<const int16_t *>(data.data());
+      size_t n = data.size() / 2;
+      float acc = 0;
+      for (size_t i = 0; i < n; i++) acc += float(x[i]) * float(x[i]);
+      float db = 10.0f * log10f(acc / n / (32768.0f * 32768.0f) + 1e-12f);
+      uint32_t i = this->lvl_i_.load();
+      this->lvl_db_[i % LVL_N] = db;
+      this->lvl_i_.store(i + 1);
     }
   });
   // Persistent network task (avoids per-session task create/delete); waits for a start notification.
@@ -92,6 +104,12 @@ void GrokStream::start() {
     return;
   }
   this->stop_requested_ = false;
+  {
+    // loudest mic block of the last ~2 s = how loud the wake word was at this device
+    float best = -120.0f;
+    for (size_t i = 0; i < LVL_N; i++) best = std::max(best, this->lvl_db_[i]);
+    this->wake_rms_db_ = best;
+  }
   {
     std::lock_guard<std::mutex> lock(this->q_mutex_);
     this->stop_reason_req_.clear();
@@ -125,6 +143,10 @@ void GrokStream::post_(const std::string &kind, const std::string &arg) {
 
 // ---- main loop: the only place that touches the speaker, the mic source and triggers ----
 void GrokStream::loop() {
+  if (!this->mic_active_ && millis() > 15000) {  // after boot/XMOS init settles
+    this->mic_source_->start();
+    this->mic_active_ = true;
+  }
   std::deque<std::pair<std::string, std::string>> events;
   {
     std::lock_guard<std::mutex> lock(this->q_mutex_);
@@ -133,8 +155,6 @@ void GrokStream::loop() {
   for (auto &ev : events) {
     const std::string &k = ev.first;
     if (k == "start") {
-      this->mic_source_->start();
-      this->mic_active_ = true;
       this->high_freq_.start();
       this->start_trigger_.trigger();
     } else if (k == "audio-start") {
@@ -153,10 +173,8 @@ void GrokStream::loop() {
     } else if (k == "state") {
       this->state_trigger_.trigger(ev.second);
     } else if (k == "end") {
-      if (this->mic_active_) {
-        this->mic_source_->stop();
-        this->mic_active_ = false;
-      }
+      // the mic source stays running between sessions (it feeds the wake-level history; the I2S mic is
+      // running anyway for micro_wake_word)
       this->ending_ = true;
       this->want_speaker_ = false;
       this->high_freq_.stop();
@@ -352,6 +370,11 @@ void GrokStream::handle_event_(const std::string &type, const std::string &data,
     this->post_("clear");
   } else if (type == "grok-state") {
     this->post_("state", json_str(data, "state", 24));
+  } else if (type == "grok-stand-down") {
+    // another Satellite answered this wake word: stop quietly and go back to wake listening (no error)
+    ESP_LOGI(TAG, "standing down: %s", json_str(data, "reason", 32).c_str());
+    this->end_reason_ = "stand_down";
+    this->stop_requested_ = true;
   } else if (type == "grok-end") {
     this->end_reason_ = json_str(data, "reason", 24);
     this->stop_requested_ = true;
@@ -370,9 +393,9 @@ void GrokStream::net_session_() {
     this->post_("end", "connect_failed");
     return;
   }
-  char hello[160];
-  snprintf(hello, sizeof(hello), "{\"token\":\"%s\",\"device\":\"%s\",\"version\":1}", this->token_.c_str(),
-           this->device_name_.c_str());
+  char hello[224];
+  snprintf(hello, sizeof(hello), "{\"token\":\"%s\",\"device\":\"%s\",\"version\":2,\"wake_rms_db\":%.1f}",
+           this->token_.c_str(), this->device_name_.c_str(), this->wake_rms_db_);
   const char *fmt = "{\"rate\":16000,\"width\":2,\"channels\":1}";
   bool ok = this->send_event_("grok-hello", hello, nullptr, 0) && this->send_event_("audio-start", fmt, nullptr, 0);
   ESP_LOGI(TAG, "connected to %s:%u, streaming", this->host_.c_str(), this->port_);
