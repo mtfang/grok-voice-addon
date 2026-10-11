@@ -223,7 +223,7 @@ def _vad():
     global _VAD
     if _VAD is None:
         from livekit.plugins import silero
-        _VAD = silero.VAD.load(min_speech_duration=0.15, activation_threshold=0.6)
+        _VAD = silero.VAD.load(min_speech_duration=0.15, min_silence_duration=0.4, activation_threshold=0.6)
     return _VAD
 
 
@@ -281,6 +281,13 @@ class Connection:
         in_stats = AudioStats("in<-device")
         in_fmt = {"rate": 16000, "width": 2, "channels": 1}
         gain = 10 ** (float(o["input_gain_db"]) / 20.0)
+        # VAD gate: the Satellite1's XMOS ASR channel is auto-gained, so between utterances the room noise floor
+        # sits around -25 dBFS RMS. xAI's server VAD can take that for ongoing speech and never end the turn (seen
+        # on the device: speech_started, transcripts, but no speech_stopped / no reply). The bridge runs Silero
+        # locally and sends xAI digital silence while Silero hears no speech, with a pre-roll so onsets aren't cut.
+        use_gate = bool(o["vad_gate"])
+        gate = {"open": not use_gate, "opened": 0}
+        preroll: collections.deque = collections.deque(maxlen=max(1, int(o["vad_gate_preroll_ms"]) // 32))
         dump = None
         if int(o["debug_dump_s"]) > 0:
             try:
@@ -369,9 +376,13 @@ class Connection:
                     payload = np.clip(x, -32768, 32767).astype("<i2").tobytes()
                 n = len(payload) // (2 * ch)
                 fr = rtc.AudioFrame(payload, rate, ch, n)
-                inp.push(fr)
                 if vad_stream is not None:
                     vad_stream.push_frame(fr)
+                if gate["open"]:
+                    inp.push(fr)
+                else:
+                    preroll.append(fr)
+                    inp.push(rtc.AudioFrame(bytes(len(payload)), rate, ch, n))
             elif etype == "audio-stop":
                 return False
             return True
@@ -379,13 +390,24 @@ class Connection:
         # Barge-in: xAI's server VAD does interrupt on its own (~0.85 s in tests), but LiveKit ignores a
         # local VAD while the realtime model does turn detection. For a faster cut-off (~0.3 s) the
         # bridge runs its own Silero VAD on the (XMOS echo-cancelled) mic audio and interrupts itself.
-        vad_stream = _vad().stream() if o["local_vad_barge_in"] else None
+        vad_stream = _vad().stream() if (o["local_vad_barge_in"] or use_gate) else None
 
         async def barge_loop():
             from livekit.agents import vad as _v
             async for vev in vad_stream:
                 if vev.type != _v.VADEventType.INFERENCE_DONE:
                     log.debug("local VAD: %s (agent_state=%s)", vev.type, session.agent_state)
+                if use_gate and vev.type == _v.VADEventType.START_OF_SPEECH and not gate["open"]:
+                    gate["open"] = True; gate["opened"] += 1
+                    for f in preroll:            # replay the onset Silero needed to decide
+                        inp.push(f)
+                    log.debug("VAD gate open (pre-roll %d ms)", len(preroll) * 32)
+                    preroll.clear()
+                elif use_gate and vev.type == _v.VADEventType.END_OF_SPEECH and gate["open"]:
+                    gate["open"] = False
+                    log.debug("VAD gate closed")
+                if not o["local_vad_barge_in"]:
+                    continue
                 if (vev.type == _v.VADEventType.START_OF_SPEECH and session.agent_state == "speaking"):
                     log.info("barge-in detected -> interrupting agent")
                     self.send("grok-state", {"state": "interrupted"})
@@ -399,6 +421,14 @@ class Connection:
             btask.add_done_callback(lambda t: t.cancelled() or not t.exception() or
                                     log.error("barge loop failed: %r", t.exception()))
         rtask = asyncio.ensure_future(reader_loop())
+
+        async def keepalive():
+            # the device ends a session after `idle_timeout` (15 s) without bytes from the bridge
+            while True:
+                await asyncio.sleep(5)
+                self.send("grok-ping", None)
+
+        ktask = asyncio.ensure_future(keepalive())
         try:
             await session.start(agent)
             log.info("xAI session ready in %.2fs", time.monotonic() - t0)
@@ -419,7 +449,7 @@ class Connection:
         except (ProtocolError, ValueError) as e:
             log.warning("protocol error from %s: %s", self.peer, e); self.end("protocol_error")
         finally:
-            rtask.cancel()
+            rtask.cancel(); ktask.cancel()
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -435,7 +465,8 @@ class Connection:
                     dump["w"].close(); log.info("audio dump written (session ended early): %s", dump["path"])
                 except Exception:
                     pass
-            log.info("%s; format %s; input gain %+.1f dB", in_stats.summary(), in_fmt, float(o["input_gain_db"]))
+            log.info("%s; format %s; input gain %+.1f dB; VAD gate %s (opened %d times)", in_stats.summary(), in_fmt,
+                     float(o["input_gain_db"]), "on" if use_gate else "off", gate["opened"])
             log.info("%s; audio from xAI %d B (24 kHz)", out.stats.summary(), out.from_xai_bytes)
             if eq is not None and (eq.limited_blocks or eq.clipped_samples):
                 log.info("EQ limiter engaged on %d ms of audio, %d samples hard-clipped",

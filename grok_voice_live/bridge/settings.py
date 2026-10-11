@@ -21,6 +21,8 @@ DEFAULTS = {
     "eq_preset_file": "",        # default: bridge/eq/satellite1_eq_preset.txt
     "output_rate": 48000,        # Satellite1 speaker pipeline native rate
     "startup_checks": True,
+    "vad_gate": True,            # send xAI silence while local Silero VAD hears no speech (noisy AGC'd mic)
+    "vad_gate_preroll_ms": 600,
     "input_gain_db": 0.0,        # software gain on device mic audio before it goes to xAI
     "debug_dump_s": 0,           # >0: write the first N s of inbound (device mic) audio to a WAV
     "debug_dump_dir": "/share/grok_voice_live",

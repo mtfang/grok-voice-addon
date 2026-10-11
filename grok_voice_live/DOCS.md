@@ -24,6 +24,13 @@ Port 10700/tcp is exposed on the host. The device opens a connection only after 
   add-on resamples xAI's 24 kHz audio to 48 kHz with soxr (HIGH quality) and the device plays it without resampling.
 - On start the add-on logs read-only checks: xAI key valid, and HA MCP reachable (tool list).
 
+## Turn detection (vad_gate)
+
+- `vad_gate` (default `true`): the Satellite1's XMOS ASR channel is auto-gained, so between utterances the room
+  noise floor is around -25 dBFS RMS, and xAI's server VAD may never see the end of a turn (speech_started and
+  transcripts, but no speech_stopped and no reply). With the gate on, the add-on runs Silero VAD locally and sends
+  xAI digital silence whenever Silero hears no speech, replaying a 600 ms pre-roll when speech starts.
+
 ## Diagnostics
 
 - `log_level: debug`: per-second inbound (device mic) and outbound (to device) audio stats (bytes/s, frames/s,
