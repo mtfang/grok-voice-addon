@@ -31,6 +31,36 @@ Port 10700/tcp is exposed on the host. The device opens a connection only after 
   transcripts, but no speech_stopped and no reply). With the gate on, the add-on runs Silero VAD locally and sends
   xAI digital silence whenever Silero hears no speech, replaying a 600 ms pre-roll when speech starts.
 
+## Conversation length and dismissal
+
+The live session is a continuing conversation: after a reply you can keep talking without the wake word.
+It ends when you dismiss Grok ("thanks", "that's all", "goodbye", "stop listening", "never mind": the model
+calls its `hang_up` tool and says a short goodbye), when you say the wake word again or press the action
+button, or after `idle_timeout_s` (default 75 s) with nobody talking. The idle timer never runs while a tool
+call or its spoken result is pending. `max_session_s` (default 600 s) caps every session.
+
+Every tool call ends with a spoken result: if the turn that issued the call was interrupted (LiveKit then
+drops the tool reply), the add-on asks Grok to report the result.
+
+## Echo cancellation and barge-in
+
+`echo_cancel` (default `true`): the add-on knows exactly what it sent to the speaker. It keeps that output as an
+echo reference (decimated to 16 kHz, on a timeline of estimated play times), tracks the echo delay with GCC-PHAT
+(the delay shifts by tens of ms between replies) and removes Grok's voice from the mic with a frequency-domain
+NLMS filter before anything else (Silero, the gate, xAI) hears it. The learned echo path is kept per device.
+
+The Satellite1's XMOS AEC leaves residual echo of Grok's own voice in the mic signal, and its AGC brings it up
+to about the level of the user's voice. While Grok's audio plays (and `echo_tail_ms`, default 350 ms, after),
+the gate toward xAI stays shut, so xAI never hears the echo, and the add-on interrupts Grok only when:
+
+- Silero VAD probability is at least `barge_threshold` (default 0.8) for `barge_min_speech_ms` (288 ms), and
+- at least `barge_frac` (40%) of those frames are `barge_margin_db` (4 dB) above the predicted residual echo
+  plus noise floor (3 dB stricter in the first 0.6 s of a reply, while the echo path settles).
+
+The echo prediction is the add-on's own output level, delayed by a fitted echo lag, plus a fitted echo
+coupling. Both are learned from the session audio (cross-correlation of the level envelopes while Grok talks)
+and remembered per device. Each session close logs the lag, coupling and how close rejected echo came.
+
 ## Diagnostics
 
 - `log_level: debug`: per-second inbound (device mic) and outbound (to device) audio stats (bytes/s, frames/s,

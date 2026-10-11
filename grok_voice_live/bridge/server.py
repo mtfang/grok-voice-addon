@@ -5,19 +5,22 @@ Per connection (opened by the device after its local wake word):
   bridge -> device : grok-state {state}, audio-start {rate:48000}, audio-chunk (PCM16 mono 48 kHz, resampled
                      from xAI's 24 kHz with soxr HIGH and run through the Satellite1 EQ + limiter),
                      audio-stop, grok-clear (barge-in: flush speaker), transcript, grok-end {reason}
-The bridge owns one LiveKit AgentSession (xAI realtime + HA MCP tools) per connection and hangs up after
-`idle_timeout_s` of silence or `max_session_s` total, so xAI is only billed while someone is talking.
+The bridge owns one LiveKit AgentSession (xAI realtime + HA MCP tools) per connection. The conversation stays
+open until the user dismisses Grok (hang_up tool: "thanks", "that's all", "goodbye"...), says the wake word again,
+or `idle_timeout_s` passes with nobody talking (never while a tool call or its spoken result is pending), capped
+at `max_session_s`.
 """
 from __future__ import annotations
 import asyncio, collections, hmac, logging, math, os, time, wave
 import numpy as np
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, mcp
+from livekit.agents import Agent, AgentSession, function_tool, mcp
 from livekit.agents.voice import io
 from livekit.plugins import xai
 
 from protocol import read_event, encode_event, ProtocolError
 from output_eq import OutputEQ
+from echo_cancel import EchoCanceller
 import settings
 
 log = logging.getLogger("grok-bridge")
@@ -88,7 +91,7 @@ class DeviceAudioOutput(io.AudioOutput):
     barge-in only has to discard a little audio (grok-clear tells the device to flush)."""
 
     def __init__(self, send, lead_s: float, on_first_chunk=None, device_rate: int = 48000,
-                 eq: OutputEQ | None = None) -> None:
+                 eq: OutputEQ | None = None, ec: EchoCanceller | None = None) -> None:
         super().__init__(label="device-speaker", capabilities=io.AudioOutputCapabilities(pause=False),
                          sample_rate=OUT_RATE)
         self._send, self._lead = send, lead_s
@@ -98,6 +101,7 @@ class DeviceAudioOutput(io.AudioOutput):
         self._chunk = device_rate * 2 * 40 // 1000          # 40 ms of PCM16 mono
         self._fmt = {"rate": device_rate, "width": 2, "channels": 1}
         self._eq = eq                                      # per-session state (one DeviceAudioOutput per session)
+        self._ec = ec                                      # gets every chunk as the echo reference
         self._rs: rtc.AudioResampler | None = None
         self._rs_in = 0
         self.stats = AudioStats("out->device")
@@ -109,7 +113,18 @@ class DeviceAudioOutput(io.AudioOutput):
         self._in_segment = False
         self._buf = bytearray()
         self._on_first_chunk = on_first_chunk
+        # playback timeline for the echo-aware barge-in: (estimated play time, chunk RMS dBFS)
+        self.timeline: collections.deque[tuple[float, float]] = collections.deque(maxlen=400)
+        self.play_end = 0.0                                # estimated time the device runs out of audio
+        self.seg_t0 = 0.0                                  # when the current/last reply segment started
         self._task = asyncio.ensure_future(self._pump())
+
+    def env_db(self, t0: float, t1: float) -> float:
+        """Loudest output chunk whose estimated play time falls in [t0, t1] (-120 if none)."""
+        return max((db for t, db in self.timeline if t0 <= t <= t1), default=-120.0)
+
+    def playing(self, now: float, tail: float = 0.0) -> bool:
+        return now < self.play_end + tail
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         await super().capture_frame(frame)
@@ -158,6 +173,9 @@ class DeviceAudioOutput(io.AudioOutput):
         if self._in_segment or self._seg_start is not None:
             pos = (time.monotonic() - self._seg_start) if self._seg_start else 0.0
             self._seg_start, self._in_segment = None, False
+            self.play_end = min(self.play_end, time.monotonic())
+            if self._ec is not None:
+                self._ec.truncate(time.monotonic())
             self._send("grok-clear", None)
             self.on_playback_finished(playback_position=min(pos, self._sent_s), interrupted=True)
         elif dropped:
@@ -174,6 +192,7 @@ class DeviceAudioOutput(io.AudioOutput):
             if item == b"START":
                 self._q.popleft()
                 self._seg_start, self._sent_s = time.monotonic(), 0.0
+                self.seg_t0 = self._seg_start
                 self._send("audio-start", self._fmt)
                 self.on_playback_started(created_at=time.time())
                 continue
@@ -205,7 +224,20 @@ class DeviceAudioOutput(io.AudioOutput):
     def _emit(self, pcm: bytes) -> None:
         if self._sent_s == 0.0 and self._on_first_chunk:
             self._on_first_chunk()
+        if self._seg_start is not None:
+            now = time.monotonic()
+            if self._seg_start + self._sent_s < now - 0.005:
+                # underrun (xAI audio arrived slower than real time): the device's buffer ran dry and it will
+                # play this chunk on arrival, so re-anchor the playback timeline (keeps the echo reference aligned)
+                self._seg_start = now - self._sent_s
+            t_play = self._seg_start + self._sent_s
+            x = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+            self.timeline.append((t_play, 20 * math.log10(float(np.sqrt(np.mean(x * x))) / 32768.0 + 1e-6)))
+            if self._ec is not None:
+                self._ec.add_ref(t_play, pcm)
         self._sent_s += len(pcm) / 2 / self.rate
+        if self._seg_start is not None:
+            self.play_end = max(self.play_end, self._seg_start + self._sent_s)
         self.stats.add(pcm)
         line = self.stats.window_line()
         if line:
@@ -227,7 +259,7 @@ def _vad():
     return _VAD
 
 
-def build_session(opts: dict) -> tuple[AgentSession, Agent]:
+def build_session(opts: dict, extra_tools: list | None = None) -> tuple[AgentSession, Agent]:
     llm = xai.realtime.RealtimeModel(model=opts["model"], voice=opts["voice"], api_key=opts["xai_api_key"])
     ha_mcp = mcp.MCPServerHTTP(
         url=opts["ha_url"].rstrip("/") + "/api/mcp", transport_type="streamable_http",
@@ -236,11 +268,93 @@ def build_session(opts: dict) -> tuple[AgentSession, Agent]:
     )
     # XMOS does hardware AEC on the device, so LiveKit's software AEC warm-up (which blocks barge-in for
     # the first 3 s of each reply) is shortened.
-    session = AgentSession(llm=llm, user_away_timeout=float(opts["idle_timeout_s"]),
+    session = AgentSession(llm=llm, user_away_timeout=None,
                            aec_warmup_duration=float(opts["aec_warmup_s"]) or None)
     agent = Agent(instructions=opts["instructions"],
-                  tools=[mcp.MCPToolset(id="home_assistant", mcp_server=ha_mcp)])
+                  tools=[mcp.MCPToolset(id="home_assistant", mcp_server=ha_mcp), *(extra_tools or [])])
     return session, agent
+
+
+class EchoModel:
+    """Predicts the residual speaker echo level in the device mic signal from what the bridge sent:
+    echo_dB(t) ~= output_dB(t - lag) + coupling. lag and coupling are fitted from the session's own audio
+    (cross-correlating the mic and output level envelopes while Grok talks; median for the coupling, so a
+    user talking over Grok doesn't skew it) and remembered per device."""
+    FR = 0.032                       # one Silero/mic frame
+    GRID = 0.008
+
+    def __init__(self, out: "DeviceAudioOutput", lag: float, coupling: float, noise: float) -> None:
+        self.out, self.lag, self.coupling, self.noise = out, lag, coupling, noise
+        self.hist: collections.deque[tuple[float, float]] = collections.deque(maxlen=190)  # (t, mic_db) in echo
+        self.frames = 0
+        self.fits = 0
+        self.corr = 0.0
+
+    def out_at(self, t: float) -> float:
+        # chunk with play time tp covers [tp, tp + 40 ms]; widen by one frame for timing slop
+        return self.out.env_db(t - 0.040 - self.FR, t + self.FR)
+
+    def expected(self, t: float) -> float:
+        return 10 * math.log10(10 ** (self.noise / 10) + 10 ** ((self.out_at(t - self.lag) + self.coupling) / 10))
+
+    def add(self, t: float, mic_db: float) -> None:
+        self.hist.append((t, mic_db)); self.frames += 1
+        if self.frames % 31 == 0 and len(self.hist) >= 60:
+            self.fit()
+
+    def fit(self) -> None:
+        tl = list(self.out.timeline)
+        if len(tl) < 20:
+            return
+        ts = np.array([x[0] for x in self.hist]); ys = np.array([x[1] for x in self.hist])
+        t0 = ts[0] - 0.6
+        n = int((ts[-1] - t0) / self.GRID) + 8
+        g = np.full(n, -120.0)
+        for tp, db in tl:                                # rasterize the output envelope on an 8 ms grid
+            a = int((tp - t0) / self.GRID); b = int((tp + 0.040 - t0) / self.GRID)
+            if b < 0 or a >= n:
+                continue
+            a, b = max(a, 0), min(b, n)
+            g[a:b] = np.maximum(g[a:b], db)
+        from scipy.ndimage import maximum_filter1d
+        g = maximum_filter1d(g, size=int(2 * self.FR / self.GRID) + 1)
+        best, best_lag = -1.0, self.lag
+        for lag in np.arange(0.0, 0.48, 0.016):
+            idx = ((ts - lag - t0) / self.GRID).astype(int)
+            ok = (idx >= 0) & (idx < n)
+            x = g[idx[ok]]; y = ys[ok]
+            m = x > -60
+            if m.sum() < 40:
+                continue
+            x, y = x[m], y[m]
+            if x.std() < 1e-3 or y.std() < 1e-3:
+                continue
+            c = float(np.corrcoef(x, y)[0, 1])
+            if c > best:
+                best, best_lag = c, float(lag)
+        self.corr = best
+        if best < 0.3:                                   # nothing echo-like left in the mic (or canceller works)
+            self.coupling = max(-15.0, self.coupling - 2.0)
+            return
+        self.lag = best_lag if self.fits == 0 else 0.5 * self.lag + 0.5 * best_lag
+        idx = ((ts - self.lag - t0) / self.GRID).astype(int)
+        ok = (idx >= 0) & (idx < n)
+        x = g[idx[ok]]; y = ys[ok]
+        pn = 10 ** (self.noise / 10)
+        m = (x > -60) & (10 ** (y / 10) > 2 * pn)        # echo clearly above the noise floor
+        if m.sum() < 30:                                 # echo is below the noise floor
+            self.coupling = max(-15.0, self.coupling - 2.0)
+            return
+        e = 10 * np.log10(np.maximum(10 ** (y[m] / 10) - pn, 1e-12)) - x[m]
+        c = float(np.median(e))
+        self.coupling = min(15.0, max(-40.0, c if self.fits == 0 else 0.5 * self.coupling + 0.5 * c))
+        self.fits += 1
+        log.debug("echo model fit: lag %.0f ms, coupling %+.1f dB (corr %.2f, %d frames)",
+                  self.lag * 1000, self.coupling, best, int(m.sum()))
+
+
+ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # peer -> (lag s, coupling dB, noise floor dBFS)
+ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # peer -> canceller (learned echo path survives sessions)
 
 
 class Connection:
@@ -276,7 +390,19 @@ class Connection:
                 return
         log.info("session open for %s (%s)", self.peer, first[1].get("device", "?"))
         t0 = time.monotonic()
-        session, agent = build_session(o)
+        hang = {"at": None}
+
+        @function_tool
+        async def hang_up() -> str:
+            """End the conversation and stop listening. Call this when the user is done or dismisses you,
+            for example: thanks, thank you that's all, that's it, goodbye, bye, stop listening, never mind,
+            go away, I'm done. Do not call it after a normal question or command."""
+            if hang["at"] is None:
+                hang["at"] = time.monotonic()
+                log.info("hang_up requested by the model")
+            return "The session will end now. Say a very short goodbye (two to four words) and nothing else."
+
+        session, agent = build_session(o, [hang_up])
         inp = QueueAudioInput()
         in_stats = AudioStats("in<-device")
         in_fmt = {"rate": 16000, "width": 2, "channels": 1}
@@ -287,6 +413,17 @@ class Connection:
         # locally and sends xAI digital silence while Silero hears no speech, with a pre-roll so onsets aren't cut.
         use_gate = bool(o["vad_gate"])
         gate = {"open": not use_gate, "opened": 0}
+        # Echo-aware barge-in. While Grok's audio is playing (and `echo_tail_ms` after), residual speaker echo
+        # in the XMOS-processed mic signal (measured on satellite1-d98894 at about -17..-22 dBFS RMS, as loud as
+        # the user's own speech, because the XMOS AGC boosts it) is loud enough for Silero to call it speech. So
+        # in that window the gate toward xAI stays shut and the bridge only interrupts when Silero is confident
+        # for `barge_min_speech_ms` AND the mic is `barge_margin_db` above the expected echo (output envelope at
+        # the estimated play time + a learned echo coupling) and above the noise floor.
+        echo = {"cand": [], "low": 0, "rejected": 0,
+                "fired": 0, "speaking": False, "mic_db": -120.0, "barging": False, "barge_t": 0.0,
+                "start_in_echo": False, "max_rej": -99.0}
+        tail_s = float(o["echo_tail_ms"]) / 1000.0
+        busy = {"tools": set(), "reply_wait_since": None, "last_gen": 0.0, "last_act": time.monotonic()}
         preroll: collections.deque = collections.deque(maxlen=max(1, int(o["vad_gate_preroll_ms"]) // 32))
         dump = None
         if int(o["debug_dump_s"]) > 0:
@@ -300,8 +437,18 @@ class Connection:
                 log.warning("cannot open audio dump: %s", e); dump = None
         rate = int(o["output_rate"])
         eq = OutputEQ(EQ_PRESET, rate) if o["eq_enabled"] else None
-        out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq)
+        ec = None
+        if o["echo_cancel"]:
+            ec = ECHO_CANCELLERS.get(self.peer)
+            if ec is None or ec.dec != max(1, rate // 16000):
+                ec = ECHO_CANCELLERS[self.peer] = EchoCanceller(out_rate=rate)
+            ec.new_session()
+            if os.environ.get("GROK_EC_DEBUG"):
+                ec.debug = []
+        out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq, ec=ec)
         session.input.audio, session.output.audio = inp, out
+        lag0, coup0, noise0 = ECHO_STATE.get(self.peer, (0.15, float(o["barge_echo_init_db"]), -30.0))
+        em = EchoModel(out, lag0, coup0, noise0)
 
         @session.on("user_input_transcribed")
         def _ut(ev):
@@ -318,12 +465,28 @@ class Connection:
         @session.on("user_state_changed")
         def _u(ev):
             log.info("user_state %s -> %s (xAI server VAD)", ev.old_state, ev.new_state)
-            if ev.new_state == "away":
-                self.end("idle")
+            busy["last_act"] = time.monotonic()
 
         @session.on("agent_state_changed")
         def _a(ev):
-            self.send("grok-state", {"state": ev.new_state})
+            busy["last_act"] = time.monotonic()
+            if (ev.new_state == "speaking" and busy["reply_wait_since"] is not None and not busy["tools"]
+                    and busy["last_gen"] > busy["reply_wait_since"]):
+                busy["reply_wait_since"] = None          # the tool result is being spoken
+            if hang["at"] is not None and ev.old_state == "speaking" and ev.new_state != "speaking":
+                asyncio.get_event_loop().call_later(0.4, self.end, "dismissed")
+            # keep the ring in "listening" for the whole open conversation instead of idle
+            self.send("grok-state", {"state": "listening" if ev.new_state in ("listening", "idle") else ev.new_state})
+
+        @session.on("tool_execution_updated")
+        def _tu(ev):
+            u = ev.update
+            busy["last_act"] = time.monotonic()
+            if u.type == "tool_call_started":
+                busy["tools"].add(u.function_call.call_id)
+                log.debug("tool started: %s", u.function_call.name)
+            elif u.type == "tool_call_ended":
+                busy["tools"].discard(u.call_id)
 
         @session.on("conversation_item_added")
         def _c(ev):
@@ -334,8 +497,39 @@ class Connection:
 
         @session.on("function_tools_executed")
         def _f(ev):
-            for call, _ in ev.zipped():
-                log.info("tool %s %s", call.name, call.arguments)
+            names = []
+            for call, res in ev.zipped():
+                busy["tools"].discard(call.call_id)
+                names.append(call.name)
+                log.info("tool %s %s -> %s", call.name, call.arguments,
+                         (str(getattr(res, "output", ""))[:160] if res is not None else "?"))
+            if any(n != "hang_up" for n in names) and hang["at"] is None:
+                busy["reply_wait_since"] = time.monotonic()
+                asyncio.ensure_future(ensure_tool_reply(busy["reply_wait_since"]))
+
+        async def ensure_tool_reply(since: float) -> None:
+            """Every tool call must end with a spoken result. LiveKit drops the tool reply when the turn that
+            issued the call was interrupted, so if no reply generation starts in time, request one."""
+            grace, quiet_since = 3.0, time.monotonic()
+            while True:
+                await asyncio.sleep(0.25)
+                if busy["reply_wait_since"] != since or self.ended.is_set():
+                    return
+                now = time.monotonic()
+                if busy["last_gen"] > since:              # the tool-result reply has been generated
+                    busy["reply_wait_since"] = None; return
+                if busy["tools"] or out.playing(now) or session.agent_state == "thinking":
+                    quiet_since = now                    # tool still running / preamble still playing
+                    continue
+                if now - quiet_since >= grace:
+                    log.warning("no spoken reply after tool call -> requesting one")
+                    try:
+                        session.generate_reply(instructions="Briefly tell the user the result of the tool call "
+                                                            "you just made, in one short sentence.")
+                    except Exception as e:
+                        log.warning("generate_reply failed: %r", e)
+                    busy["reply_wait_since"] = None
+                    return
 
         @session.on("close")
         def _cl(ev):
@@ -374,8 +568,16 @@ class Connection:
                 if gain != 1.0:
                     x = np.frombuffer(payload, dtype="<i2").astype(np.float32) * gain
                     payload = np.clip(x, -32768, 32767).astype("<i2").tobytes()
+                if ec is not None and rate == 16000 and ch == 1:
+                    payload = ec.process(time.monotonic(), payload)   # remove Grok's own voice
                 n = len(payload) // (2 * ch)
                 fr = rtc.AudioFrame(payload, rate, ch, n)
+                xx = np.frombuffer(payload, dtype="<i2").astype(np.float32)
+                echo["mic_db"] = 20 * math.log10(float(np.sqrt(np.mean(xx * xx))) / 32768.0 + 1e-6)
+                if (gate["open"] and use_gate and out.playing(time.monotonic(), tail_s)
+                        and (not echo["barging"] or out.seg_t0 > echo["barge_t"] + 0.2)):
+                    gate["open"] = False; echo["barging"] = False   # Grok is talking: shut the gate until a barge-in
+                    log.debug("VAD gate closed (agent audio playing)")
                 if vad_stream is not None:
                     vad_stream.push_frame(fr)
                 if gate["open"]:
@@ -390,33 +592,101 @@ class Connection:
         # Barge-in: xAI's server VAD does interrupt on its own (~0.85 s in tests), but LiveKit ignores a
         # local VAD while the realtime model does turn detection. For a faster cut-off (~0.3 s) the
         # bridge runs its own Silero VAD on the (XMOS echo-cancelled) mic audio and interrupts itself.
-        vad_stream = _vad().stream() if (o["local_vad_barge_in"] or use_gate) else None
+        vad_stream = _vad().stream()
+
+        def open_gate(why: str, keep: int | None = None) -> None:
+            if gate["open"]:
+                return
+            gate["open"] = True; gate["opened"] += 1
+            frames = list(preroll)[-keep:] if keep else list(preroll)
+            for f in frames:                     # replay the onset Silero needed to decide
+                inp.push(f)
+            log.debug("VAD gate open (%s, pre-roll %d ms)", why, len(preroll) * 32)
+            preroll.clear()
+
+        def tool_busy() -> bool:
+            return bool(busy["tools"]) or busy["reply_wait_since"] is not None or hang["at"] is not None
+
+        thr = float(o["barge_threshold"]); margin = float(o["barge_margin_db"])
+        min_frames = max(1, int(o["barge_min_speech_ms"]) // 32)
 
         async def barge_loop():
             from livekit.agents import vad as _v
             async for vev in vad_stream:
+                now = time.monotonic()
+                if vev.type == _v.VADEventType.START_OF_SPEECH:
+                    echo["speaking"] = True
+                    echo["start_in_echo"] = out.playing(now, tail_s)
+                elif vev.type == _v.VADEventType.END_OF_SPEECH:
+                    echo["speaking"] = False; echo["start_in_echo"] = False
                 if vev.type != _v.VADEventType.INFERENCE_DONE:
-                    log.debug("local VAD: %s (agent_state=%s)", vev.type, session.agent_state)
-                if use_gate and vev.type == _v.VADEventType.START_OF_SPEECH and not gate["open"]:
-                    gate["open"] = True; gate["opened"] += 1
-                    for f in preroll:            # replay the onset Silero needed to decide
-                        inp.push(f)
-                    log.debug("VAD gate open (pre-roll %d ms)", len(preroll) * 32)
-                    preroll.clear()
-                elif use_gate and vev.type == _v.VADEventType.END_OF_SPEECH and gate["open"]:
-                    gate["open"] = False
-                    log.debug("VAD gate closed")
-                if not o["local_vad_barge_in"]:
+                    log.debug("local VAD: %s (agent_state=%s, playing=%s)", vev.type, session.agent_state,
+                              out.playing(now, tail_s))
+                    if vev.type == _v.VADEventType.END_OF_SPEECH and gate["open"] and use_gate:
+                        gate["open"] = False
+                        log.debug("VAD gate closed")
                     continue
-                if (vev.type == _v.VADEventType.START_OF_SPEECH and session.agent_state == "speaking"):
-                    log.info("barge-in detected -> interrupting agent")
+                p, mic = float(vev.probability), echo["mic_db"]
+                in_echo = out.playing(now, tail_s)
+                expected = em.expected(now)
+                excess = mic - expected
+                if not in_echo and not echo["start_in_echo"]:
+                    if p < 0.3:                          # track the noise floor between utterances
+                        em.noise += (mic - em.noise) * (0.05 if mic < em.noise else 0.01)
+                    echo["cand"].clear()
+                    if use_gate and echo["speaking"] and not gate["open"]:
+                        open_gate("speech")
+                    continue
+                if in_echo:
+                    em.add(now, mic)
+                # the first ~0.8 s of each reply: the echo delay jumps by tens of ms between replies, so until the
+                # canceller has re-locked (and the XMOS AEC re-converged) residual echo is higher: be stricter
+                m_eff = margin + (float(o["barge_onset_extra_db"]) if now - out.seg_t0 < 0.8 else 0.0)
+                if p >= thr:
+                    echo["cand"].append((p, excess, m_eff)); echo["low"] = 0
+                else:
+                    echo["low"] += 1
+                    if echo["low"] >= 2:                 # tolerate one-frame dips
+                        if len(echo["cand"]) >= 3:
+                            echo["rejected"] += 1
+                            w = echo["cand"][-min_frames:]
+                            frac = sum(1 for x in w if x[1] >= x[2]) / len(w)
+                            echo["max_rej"] = max(echo["max_rej"], frac)
+                            log.debug("echo candidate rejected: %d frames, %.0f%% above echo+margin, median %.1f dB",
+                                      len(echo["cand"]), 100 * frac, float(np.median([x[1] for x in w])))
+                        echo["cand"].clear()
+                if len(echo["cand"]) < min_frames:
+                    continue
+                win = echo["cand"][-min_frames:]
+                mean_p = sum(x[0] for x in win) / len(win)
+                med_ex = float(np.median([x[1] for x in win]))
+                frac = sum(1 for x in win if x[1] >= x[2]) / len(win)
+                # user speech fills the syllable gaps of Grok's echo: require enough frames well above the
+                # predicted echo, not just a louder average
+                if frac < float(o["barge_frac"]):
+                    continue
+                if tool_busy():
+                    log.debug("barge-in suppressed: tool call / tool reply / hang-up pending")
+                    echo["cand"].clear(); continue
+                echo["cand"].clear(); echo["barging"] = True; echo["barge_t"] = now
+                if not in_echo:                          # speech right after Grok stopped: just let it through
+                    log.debug("speech confirmed after agent audio (%.1f dB over expected)", med_ex)
+                    if use_gate:
+                        open_gate("speech after agent audio", keep=min_frames + 4)
+                    continue
+                echo["fired"] += 1
+                log.info("barge-in detected (p=%.2f, %.0f%% of frames above echo+margin, median %.1f dB over "
+                         "expected echo %.1f dBFS) -> interrupting agent", mean_p, 100 * frac, med_ex, expected)
+                if use_gate:
+                    open_gate("barge-in", keep=min_frames + 4)
+                if o["local_vad_barge_in"] and session.agent_state == "speaking":
                     self.send("grok-state", {"state": "interrupted"})
                     try:
                         await session.interrupt(force=True)
                     except Exception as e:
                         log.debug("interrupt: %s", e)
 
-        btask = asyncio.ensure_future(barge_loop()) if vad_stream else None
+        btask = asyncio.ensure_future(barge_loop())
         if btask:
             btask.add_done_callback(lambda t: t.cancelled() or not t.exception() or
                                     log.error("barge loop failed: %r", t.exception()))
@@ -429,6 +699,23 @@ class Connection:
                 self.send("grok-ping", None)
 
         ktask = asyncio.ensure_future(keepalive())
+
+        async def watchdog():
+            idle = float(o["idle_timeout_s"])
+            while True:
+                await asyncio.sleep(0.5)
+                now = time.monotonic()
+                if hang["at"] is not None and now - hang["at"] > 8.0:
+                    self.end("dismissed"); return
+                active = (gate["open"] or echo["speaking"] or session.agent_state in ("speaking", "thinking")
+                          or out.playing(now) or busy["tools"] or busy["reply_wait_since"] is not None
+                          or session.user_state == "speaking")
+                if active:
+                    busy["last_act"] = now
+                elif now - busy["last_act"] > idle:
+                    self.end("idle"); return
+
+        wtask = asyncio.ensure_future(watchdog())
         try:
             await session.start(agent)
             log.info("xAI session ready in %.2fs", time.monotonic() - t0)
@@ -438,7 +725,10 @@ class Connection:
                 rt.on("input_speech_stopped", lambda ev: log.info("xAI: input_audio_buffer.speech_stopped"))
                 rt.on("input_audio_transcription_completed",
                       lambda ev: log.info("xAI: input transcription: %s", getattr(ev, "transcript", "")))
-                rt.on("generation_created", lambda ev: log.debug("xAI: response generation created"))
+                def _gen(ev):
+                    busy["last_gen"] = time.monotonic(); busy["last_act"] = busy["last_gen"]
+                    log.debug("xAI: response generation created")
+                rt.on("generation_created", _gen)
                 rt.on("error", lambda ev: log.warning("xAI error: %r", getattr(ev, "error", ev)))
             else:
                 log.debug("realtime session handle not available for event hooks")
@@ -449,7 +739,8 @@ class Connection:
         except (ProtocolError, ValueError) as e:
             log.warning("protocol error from %s: %s", self.peer, e); self.end("protocol_error")
         finally:
-            rtask.cancel(); ktask.cancel()
+            rtask.cancel(); ktask.cancel(); wtask.cancel()
+            ECHO_STATE[self.peer] = (em.lag, em.coupling, em.noise)
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -467,6 +758,19 @@ class Connection:
                     pass
             log.info("%s; format %s; input gain %+.1f dB; VAD gate %s (opened %d times)", in_stats.summary(), in_fmt,
                      float(o["input_gain_db"]), "on" if use_gate else "off", gate["opened"])
+            if ec is not None and ec.debug is not None:
+                np.save(os.environ["GROK_EC_DEBUG"] + f"_{int(time.time())}.npy",
+                        np.array([np.concatenate([m, r]) for m, r in ec.debug if len(r) == 512 + 3200]))
+                np.save(os.environ["GROK_EC_DEBUG"] + f"_res_{int(time.time())}.npy",
+                        np.array([np.concatenate([[f], e, y]) for f, e, y in getattr(ec, "res_dbg", [])]))
+                ec.res_dbg = []
+            if ec is not None:
+                log.info("echo canceller: bulk delay %s ms, ERLE %.1f dB (gcc peak %.0f)",
+                         f"{ec.delay / 16:.0f}" if ec.delay is not None else "?", ec.erle_db, ec.gcc_peak)
+            log.info("echo: lag %.0f ms, coupling %+.1f dB (fits %d, corr %.2f), noise floor %.1f dBFS; barge-ins %d, "
+                     "echo candidates rejected %d (worst: %.0f%% of frames above echo+%.1f dB; needs %.0f%%)",
+                     em.lag * 1000, em.coupling, em.fits, em.corr, em.noise, echo["fired"], echo["rejected"],
+                     100 * max(0.0, echo["max_rej"]), margin, 100 * float(o["barge_frac"]))
             log.info("%s; audio from xAI %d B (24 kHz)", out.stats.summary(), out.from_xai_bytes)
             if eq is not None and (eq.limited_blocks or eq.clipped_samples):
                 log.info("EQ limiter engaged on %d ms of audio, %d samples hard-clipped",
