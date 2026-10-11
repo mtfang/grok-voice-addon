@@ -69,3 +69,25 @@ and remembered per device. Each session close logs the lag, coupling and how clo
 - `debug_dump_s` (0-60, default 0): write the first N seconds of raw inbound audio of each session to
   `/share/grok_voice_live/inbound_<time>.wav` (reachable via the Samba / File editor add-ons).
 - `input_gain_db` (default 0): software gain on device mic audio before it is sent to xAI.
+
+## Tools: home vs. everything else (0.4.1)
+
+Home Assistant MCP tools are only used for the home (devices, states, timers, lists, broadcasts). Everything
+else uses xAI's own server-side tools: `web_search` and `x_search` (both on by default). HA tools whose names
+match `hidden_tool_pattern` (default: search/google/wiki/web/news/weather/`llm__`) are hidden from the live
+agent, e.g. `script.assist_search_google` and `llm__GetDateTime`; the local date and time (`timezone`, default
+America/Los_Angeles) is written into the instructions at session start instead.
+
+## Barge-in context (0.4.1)
+
+When a barge-in fires, the bridge forwards the echo-cancelled mic audio from the local VAD onset minus 300 ms
+(not a fixed pre-roll), so the start of the interruption is not cut off. While a confirmed barge-in overlaps
+Grok's audio, the echo canceller stops adapting (it would otherwise learn the user's voice and distort it).
+The interrupted reply is truncated server-side to what was actually played (`conversation.item.truncate`),
+and the same realtime session is kept across barge-ins and tool calls, so earlier turns stay in context.
+
+## Several satellites
+
+One bridge serves any number of devices at once: one session per device (keyed by the device name from its
+hello; a new wake from the same device replaces its old session), separate echo-canceller state per device,
+and every log line is tagged `[device-name]`.

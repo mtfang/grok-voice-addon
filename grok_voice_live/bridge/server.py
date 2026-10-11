@@ -11,7 +11,7 @@ or `idle_timeout_s` passes with nobody talking (never while a tool call or its s
 at `max_session_s`.
 """
 from __future__ import annotations
-import asyncio, collections, hmac, logging, math, os, time, wave
+import asyncio, collections, datetime, hmac, logging, math, os, time, wave
 import numpy as np
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, function_tool, mcp
@@ -24,6 +24,27 @@ from echo_cancel import EchoCanceller
 import settings
 
 log = logging.getLogger("grok-bridge")
+import contextvars
+# Which device a log line belongs to: set per connection; asyncio tasks (incl. LiveKit's) inherit it.
+DEVICE: contextvars.ContextVar[str] = contextvars.ContextVar("grok_device", default="-")
+
+
+class _ServerToolLog(logging.Filter):
+    """The xAI plugin warns 'unknown function tool: web_search' when xAI runs one of its own server-side tools;
+    that is expected: log it as the tool call it is."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if msg.startswith("unknown function tool: ") and msg.split(": ", 1)[1].split(",")[0] in ("web_search", "x_search"):
+            record.levelno, record.levelname = logging.INFO, "INFO"
+            record.msg, record.args = "xAI server tool call: %s (run by xAI)", (msg.split(": ", 1)[1].split(",")[0],)
+        return True
+
+
+class _DeviceTag(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.device = DEVICE.get()
+        return True
 EQ_PRESET = ""  # loaded in main()
 OUT_RATE = 24000  # rate LiveKit hands us (xAI realtime output); we resample to the device rate ourselves
 
@@ -117,11 +138,33 @@ class DeviceAudioOutput(io.AudioOutput):
         self.timeline: collections.deque[tuple[float, float]] = collections.deque(maxlen=400)
         self.play_end = 0.0                                # estimated time the device runs out of audio
         self.seg_t0 = 0.0                                  # when the current/last reply segment started
+        self.seg_n = 0                                     # audio-start events sent (matches the device's count)
+        self.seg_pos = 0                                   # samples of the current reply sent so far
+        self.seg_chunks: list[tuple[int, float]] = []      # (reply sample pos, t_play) of this reply's chunks
+        self.ref_shift = 0.0                               # correction from the device's grok-played markers
         self._task = asyncio.ensure_future(self._pump())
 
     def env_db(self, t0: float, t1: float) -> float:
         """Loudest output chunk whose estimated play time falls in [t0, t1] (-120 if none)."""
         return max((db for t, db in self.timeline if t0 <= t <= t1), default=-120.0)
+
+    def device_played(self, seg: int, pos: int, t_true: float) -> float | None:
+        """Device marker: reply sample `pos` of reply `seg` entered the speaker at bridge time t_true.
+        Shift the echo reference of this reply (already sent and future chunks) to match. Returns the shift."""
+        if seg != self.seg_n or not self.seg_chunks:
+            return None
+        p0, t0 = max(((p, t) for p, t in self.seg_chunks if p <= pos), default=self.seg_chunks[0])
+        t_est = t0 + (pos - p0) / self.rate
+        delta = t_true - t_est
+        if abs(delta) < 0.002 or abs(delta) > 1.0:
+            return delta
+        self.ref_shift += delta
+        self.seg_chunks = [(p, t + delta) if p >= p0 else (p, t) for p, t in self.seg_chunks]
+        self.timeline = collections.deque(((t + delta) if t >= t_est - 0.001 else t, db) for t, db in self.timeline)
+        self.timeline = collections.deque(self.timeline, maxlen=400)
+        if self._ec is not None:
+            self._ec.move(t_est, delta)
+        return delta
 
     def playing(self, now: float, tail: float = 0.0) -> bool:
         return now < self.play_end + tail
@@ -193,6 +236,9 @@ class DeviceAudioOutput(io.AudioOutput):
                 self._q.popleft()
                 self._seg_start, self._sent_s = time.monotonic(), 0.0
                 self.seg_t0 = self._seg_start
+                self.seg_n += 1; self.seg_pos = 0; self.seg_chunks = []; self.ref_shift = 0.0
+                if self._ec is not None:
+                    self._ec.new_segment(self._seg_start)
                 self._send("audio-start", self._fmt)
                 self.on_playback_started(created_at=time.time())
                 continue
@@ -230,7 +276,9 @@ class DeviceAudioOutput(io.AudioOutput):
                 # underrun (xAI audio arrived slower than real time): the device's buffer ran dry and it will
                 # play this chunk on arrival, so re-anchor the playback timeline (keeps the echo reference aligned)
                 self._seg_start = now - self._sent_s
-            t_play = self._seg_start + self._sent_s
+            t_play = self._seg_start + self._sent_s + self.ref_shift
+            self.seg_chunks.append((self.seg_pos, t_play))
+            self.seg_pos += len(pcm) // 2
             x = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
             self.timeline.append((t_play, 20 * math.log10(float(np.sqrt(np.mean(x * x))) / 32768.0 + 1e-6)))
             if self._ec is not None:
@@ -259,6 +307,30 @@ def _vad():
     return _VAD
 
 
+class FilteredMCPToolset(mcp.MCPToolset):
+    """HA MCP tools minus the ones listed in `hidden_tools` (e.g. a broken web-search script that xAI's own
+    web search replaces)."""
+
+    def __init__(self, *a, hidden: set[str] | None = None, pattern: str = "", **kw) -> None:
+        super().__init__(*a, **kw)
+        self._hidden = hidden or set()
+        import re
+        self._pat = re.compile(pattern, re.I) if pattern else None
+
+    async def setup(self, *, reload: bool = False):
+        await super().setup(reload=reload)
+        from livekit.agents.llm.tool_context import get_raw_function_info
+        keep, hid = [], []
+        for t in self._tools:
+            n = get_raw_function_info(t).name
+            (hid if (n in self._hidden or (self._pat and self._pat.search(n))) else keep).append(t)
+        if hid:
+            log.info("HA tools hidden from the live agent (non-home): %s",
+                     ", ".join(get_raw_function_info(t).name for t in hid))
+        self._tools = keep
+        return self
+
+
 def build_session(opts: dict, extra_tools: list | None = None) -> tuple[AgentSession, Agent]:
     llm = xai.realtime.RealtimeModel(model=opts["model"], voice=opts["voice"], api_key=opts["xai_api_key"])
     ha_mcp = mcp.MCPServerHTTP(
@@ -270,8 +342,22 @@ def build_session(opts: dict, extra_tools: list | None = None) -> tuple[AgentSes
     # the first 3 s of each reply) is shortened.
     session = AgentSession(llm=llm, user_away_timeout=None,
                            aec_warmup_duration=float(opts["aec_warmup_s"]) or None)
-    agent = Agent(instructions=opts["instructions"],
-                  tools=[mcp.MCPToolset(id="home_assistant", mcp_server=ha_mcp), *(extra_tools or [])])
+    tools: list = [FilteredMCPToolset(id="home_assistant", mcp_server=ha_mcp, hidden=set(opts["hidden_tools"]),
+                                      pattern=opts["hidden_tool_pattern"])]
+    if opts["web_search"]:
+        tools.append(xai.realtime.WebSearch())        # xAI server-side search (no client round trip)
+    if opts["x_search"]:
+        tools.append(xai.realtime.XSearch())
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.datetime.now(ZoneInfo(opts["timezone"]))
+        when = now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z") + f" ({opts['timezone']})"
+    except Exception:
+        when = datetime.datetime.now().astimezone().strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
+    instructions = opts["instructions"] + f" The current local date and time at the start of this conversation is {when}."
+    log.info("xAI server tools: %s", ", ".join(n for n, on in (("web_search", opts["web_search"]),
+                                                                  ("x_search", opts["x_search"])) if on) or "none")
+    agent = Agent(instructions=instructions, tools=[*tools, *(extra_tools or [])])
     return session, agent
 
 
@@ -353,14 +439,17 @@ class EchoModel:
                   self.lag * 1000, self.coupling, best, int(m.sum()))
 
 
-ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # peer -> (lag s, coupling dB, noise floor dBFS)
-ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # peer -> canceller (learned echo path survives sessions)
+ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # device -> (lag s, coupling dB, noise floor dBFS)
+ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # device -> canceller (learned echo path survives sessions)
+ACTIVE: dict[str, asyncio.Task] = {}                      # device -> its running session task
 
 
 class Connection:
     def __init__(self, opts, reader, writer) -> None:
         self.opts, self.reader, self.writer = opts, reader, writer
         self.peer = writer.get_extra_info("peername")[0]
+        self.device = self.peer
+        self.device_stop_reason = ""
         self.ended = asyncio.Event()
         self.end_reason = "client"
         self.t_first_out: float | None = None
@@ -388,7 +477,18 @@ class Connection:
                 log.warning("rejecting client %s (bad token)", self.peer)
                 self.send("grok-end", {"reason": "unauthorized"}); await self.writer.drain()
                 return
-        log.info("session open for %s (%s)", self.peer, first[1].get("device", "?"))
+        import re as _re
+        self.device = _re.sub(r"[^A-Za-z0-9_.-]", "_", str(first[1].get("device") or self.peer))[:64]
+        DEVICE.set(self.device)
+        # one session per device: a new wake from the same device replaces its old session; other devices'
+        # sessions are untouched (state below is keyed by device name, not by a single global)
+        old = ACTIVE.get(self.device)
+        if old is not None and old is not asyncio.current_task() and not old.done():
+            log.info("replacing the previous session of %s", self.device)
+            old.cancel()
+        ACTIVE[self.device] = asyncio.current_task()
+        log.info("session open for %s (%s); %d active session(s)", self.peer, self.device,
+                 sum(1 for t in ACTIVE.values() if not t.done()))
         t0 = time.monotonic()
         hang = {"at": None}
 
@@ -425,11 +525,12 @@ class Connection:
         tail_s = float(o["echo_tail_ms"]) / 1000.0
         busy = {"tools": set(), "reply_wait_since": None, "last_gen": 0.0, "last_act": time.monotonic()}
         preroll: collections.deque = collections.deque(maxlen=max(1, int(o["vad_gate_preroll_ms"]) // 32))
+        onset_buf: collections.deque = collections.deque(maxlen=63)   # (t, frame), ~2 s of cleaned mic
         dump = None
         if int(o["debug_dump_s"]) > 0:
             try:
                 os.makedirs(o["debug_dump_dir"], exist_ok=True)
-                path = os.path.join(o["debug_dump_dir"], time.strftime("inbound_%Y%m%d_%H%M%S.wav"))
+                path = os.path.join(o["debug_dump_dir"], time.strftime("inbound_%Y%m%d_%H%M%S") + f"_{self.device}.wav")
                 dump = {"path": path, "w": wave.open(path, "wb"), "left": int(o["debug_dump_s"]) * 16000 * 2}
                 dump["w"].setnchannels(1); dump["w"].setsampwidth(2); dump["w"].setframerate(16000)
                 log.info("dumping first %ss of inbound audio (raw, before gain) to %s", o["debug_dump_s"], path)
@@ -439,15 +540,15 @@ class Connection:
         eq = OutputEQ(EQ_PRESET, rate) if o["eq_enabled"] else None
         ec = None
         if o["echo_cancel"]:
-            ec = ECHO_CANCELLERS.get(self.peer)
+            ec = ECHO_CANCELLERS.get(self.device)
             if ec is None or ec.dec != max(1, rate // 16000):
-                ec = ECHO_CANCELLERS[self.peer] = EchoCanceller(out_rate=rate)
+                ec = ECHO_CANCELLERS[self.device] = EchoCanceller(out_rate=rate)
             ec.new_session()
             if os.environ.get("GROK_EC_DEBUG"):
                 ec.debug = []
         out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq, ec=ec)
         session.input.audio, session.output.audio = inp, out
-        lag0, coup0, noise0 = ECHO_STATE.get(self.peer, (0.15, float(o["barge_echo_init_db"]), -30.0))
+        lag0, coup0, noise0 = ECHO_STATE.get(self.device, (0.15, float(o["barge_echo_init_db"]), -30.0))
         em = EchoModel(out, lag0, coup0, noise0)
 
         @session.on("user_input_transcribed")
@@ -473,6 +574,7 @@ class Connection:
             if (ev.new_state == "speaking" and busy["reply_wait_since"] is not None and not busy["tools"]
                     and busy["last_gen"] > busy["reply_wait_since"]):
                 busy["reply_wait_since"] = None          # the tool result is being spoken
+                busy["tool_reply_t"] = time.monotonic()  # protect its start from echo barge-in
             if hang["at"] is not None and ev.old_state == "speaking" and ev.new_state != "speaking":
                 asyncio.get_event_loop().call_later(0.4, self.end, "dismissed")
             # keep the ring in "listening" for the whole open conversation instead of idle
@@ -543,7 +645,7 @@ class Connection:
                 if ev is None:
                     self.end("client_closed"); return
                 if not handle(ev):
-                    self.end("client_stop"); return
+                    self.end(f"client_stop ({self.device_stop_reason or 'no reason given'})"); return
 
         def handle(ev) -> bool:
             nonlocal dump
@@ -580,12 +682,20 @@ class Connection:
                     log.debug("VAD gate closed (agent audio playing)")
                 if vad_stream is not None:
                     vad_stream.push_frame(fr)
+                onset_buf.append((time.monotonic(), fr))
                 if gate["open"]:
                     inp.push(fr)
                 else:
                     preroll.append(fr)
                     inp.push(rtc.AudioFrame(bytes(len(payload)), rate, ch, n))
+            elif etype == "grok-played":
+                if ec is not None and ec.Tm0 is not None:
+                    t_true = ec.Tm0 + int(data.get("mic", 0)) / 16000.0
+                    d = out.device_played(int(data.get("seg", -1)), int(data.get("pos", 0)), t_true)
+                    log.debug("device playback marker seg %s pos %s: reference shifted %s ms", data.get("seg"),
+                              data.get("pos"), "n/a" if d is None else f"{d * 1000:+.0f}")
             elif etype == "audio-stop":
+                self.device_stop_reason = str((data or {}).get("reason") or "unspecified")[:40]
                 return False
             return True
 
@@ -594,18 +704,23 @@ class Connection:
         # bridge runs its own Silero VAD on the (XMOS echo-cancelled) mic audio and interrupts itself.
         vad_stream = _vad().stream()
 
-        def open_gate(why: str, keep: int | None = None) -> None:
+        def open_gate(why: str, keep: int | None = None, since: float | None = None) -> None:
             if gate["open"]:
                 return
             gate["open"] = True; gate["opened"] += 1
-            frames = list(preroll)[-keep:] if keep else list(preroll)
+            if since is not None:                # everything from the speech onset (minus a margin) onward
+                frames = [f for t, f in onset_buf if t >= since]
+            else:
+                frames = list(preroll)[-keep:] if keep else list(preroll)
             for f in frames:                     # replay the onset Silero needed to decide
                 inp.push(f)
-            log.debug("VAD gate open (%s, pre-roll %d ms)", why, len(preroll) * 32)
+            log.debug("VAD gate open (%s, pre-roll %d ms)", why, len(frames) * 32)
             preroll.clear()
 
         def tool_busy() -> bool:
-            return bool(busy["tools"]) or busy["reply_wait_since"] is not None or hang["at"] is not None
+            return (bool(busy["tools"]) or busy["reply_wait_since"] is not None or hang["at"] is not None
+                    # the first seconds of a tool-result reply can't be cut by barge-in (the result must be heard)
+                    or time.monotonic() - busy.get("tool_reply_t", -1e9) < float(o["tool_reply_protect_s"]))
 
         thr = float(o["barge_threshold"]); margin = float(o["barge_margin_db"])
         min_frames = max(1, int(o["barge_min_speech_ms"]) // 32)
@@ -616,9 +731,14 @@ class Connection:
                 now = time.monotonic()
                 if vev.type == _v.VADEventType.START_OF_SPEECH:
                     echo["speaking"] = True
+                    # Silero reports START after min_speech_duration of speech: back-date to the onset
+                    echo["onset_t"] = now - float(getattr(vev, "speech_duration", 0.15) or 0.15)
                     echo["start_in_echo"] = out.playing(now, tail_s)
                 elif vev.type == _v.VADEventType.END_OF_SPEECH:
                     echo["speaking"] = False; echo["start_in_echo"] = False
+                    echo["dt"] = False                   # double-talk over: let the echo filter adapt again
+                    if ec is not None:
+                        ec.freeze = False
                 if vev.type != _v.VADEventType.INFERENCE_DONE:
                     log.debug("local VAD: %s (agent_state=%s, playing=%s)", vev.type, session.agent_state,
                               out.playing(now, tail_s))
@@ -631,6 +751,8 @@ class Connection:
                 expected = em.expected(now)
                 excess = mic - expected
                 if not in_echo and not echo["start_in_echo"]:
+                    if ec is not None:
+                        ec.freeze = False
                     if p < 0.3:                          # track the noise floor between utterances
                         em.noise += (mic - em.noise) * (0.05 if mic < em.noise else 0.01)
                     echo["cand"].clear()
@@ -641,7 +763,12 @@ class Connection:
                     em.add(now, mic)
                 # the first ~0.8 s of each reply: the echo delay jumps by tens of ms between replies, so until the
                 # canceller has re-locked (and the XMOS AEC re-converged) residual echo is higher: be stricter
-                m_eff = margin + (float(o["barge_onset_extra_db"]) if now - out.seg_t0 < 0.8 else 0.0)
+                m_eff = margin + (float(o["barge_onset_extra_db"]) if now - out.seg_t0 < float(o["barge_onset_s"]) else 0.0)
+                if ec is not None:
+                    # double-talk (barge-in confirmed while Grok's audio is still in the air): don't let the echo
+                    # filter adapt on the user's voice, it would distort it. Not before the barge-in is confirmed:
+                    # freezing on residual echo at a reply onset would stop the filter from re-converging.
+                    ec.freeze = bool(echo.get("dt"))
                 if p >= thr:
                     echo["cand"].append((p, excess, m_eff)); echo["low"] = 0
                 else:
@@ -672,13 +799,14 @@ class Connection:
                 if not in_echo:                          # speech right after Grok stopped: just let it through
                     log.debug("speech confirmed after agent audio (%.1f dB over expected)", med_ex)
                     if use_gate:
-                        open_gate("speech after agent audio", keep=min_frames + 4)
+                        open_gate("speech after agent audio", since=echo.get("onset_t", now - 0.6) - 0.3)
                     continue
                 echo["fired"] += 1
+                echo["dt"] = True                        # user talking over Grok's (still audible) audio
                 log.info("barge-in detected (p=%.2f, %.0f%% of frames above echo+margin, median %.1f dB over "
                          "expected echo %.1f dBFS) -> interrupting agent", mean_p, 100 * frac, med_ex, expected)
                 if use_gate:
-                    open_gate("barge-in", keep=min_frames + 4)
+                    open_gate("barge-in", since=echo.get("onset_t", now - 0.6) - 0.3)
                 if o["local_vad_barge_in"] and session.agent_state == "speaking":
                     self.send("grok-state", {"state": "interrupted"})
                     try:
@@ -740,7 +868,7 @@ class Connection:
             log.warning("protocol error from %s: %s", self.peer, e); self.end("protocol_error")
         finally:
             rtask.cancel(); ktask.cancel(); wtask.cancel()
-            ECHO_STATE[self.peer] = (em.lag, em.coupling, em.noise)
+            ECHO_STATE[self.device] = (em.lag, em.coupling, em.noise)
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -817,7 +945,10 @@ async def startup_checks(opts: dict) -> None:
 async def main() -> None:
     opts = settings.load()
     logging.basicConfig(level=getattr(logging, opts["log_level"].upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                        format="%(asctime)s %(levelname)s [%(device)s] %(name)s: %(message)s")
+    for h in logging.getLogger().handlers:
+        h.addFilter(_DeviceTag())
+    logging.getLogger("livekit.plugins.xai").addFilter(_ServerToolLog())
     logging.getLogger("livekit.agents").setLevel(os.environ.get("LIVEKIT_LOG_LEVEL", "WARNING"))
     for noisy in ("httpx", "httpcore", "websockets", "asyncio", "mcp", "aiohttp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -835,19 +966,16 @@ async def main() -> None:
         log.info("output EQ off; output %d Hz", int(opts["output_rate"]))
     if opts["startup_checks"]:
         await startup_checks(opts)
-    active: dict[str, asyncio.Task] = {}
 
     async def on_client(reader, writer):
         peer = writer.get_extra_info("peername")[0]
+        DEVICE.set(peer)                   # refined to the device name once its hello arrives
         sock = writer.get_extra_info("socket")
         try:
             import socket as _s; sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
         except Exception:
             pass
-        if peer in active and not active[peer].done():
-            active[peer].cancel()          # a new wake from the same device replaces the old session
         conn = Connection(opts, reader, writer)
-        active[peer] = asyncio.current_task()
         try:
             await conn.run()
         except (asyncio.TimeoutError, ProtocolError, ConnectionError) as e:

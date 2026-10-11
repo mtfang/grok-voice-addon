@@ -35,9 +35,13 @@ class EchoCanceller:
         self.gcc_peak = 0.0
         self.erle_db = 0.0
         self.debug: list | None = None           # tests: per-frame (mic, ref window) capture
+        self.seg_r0: int | None = None           # ref index where the current reply starts
+        self.seg_locked = True
+        self.freeze = False
 
     def new_session(self) -> None:
         """New connection: new timelines, but keep the learned echo path (delay + filter) for this device."""
+        self.freeze = False
         self.ref[:] = 0; self.ref_hi = -1; self.T0 = None; self.Tm0 = None; self.m = 0
         self.mic_hist[:] = 0; self.frames = 0
         if self.lp_zi is not None:
@@ -57,6 +61,31 @@ class EchoCanceller:
         idx = np.arange(i0, i0 + len(x)) % RING
         self.ref[idx] = x
         self.ref_hi = max(self.ref_hi, i0 + len(x) - 1)
+
+    def new_segment(self, t_play: float) -> None:
+        """A new reply starts: re-lock the echo delay on its first ~200 ms (it can jump between replies)."""
+        self.freeze = False
+        if self.T0 is not None:
+            self.seg_r0 = int(round((t_play - self.T0) * FS)); self.seg_locked = False
+
+    def move(self, t_from: float, delta: float) -> None:
+        """Shift the reference from t_from on by delta seconds (device reported the true playback start)."""
+        if self.T0 is None:
+            return
+        a = int(round((t_from - self.T0) * FS)); d = int(round(delta * FS))
+        if a > self.ref_hi or d == 0:
+            return
+        seg = self._ref_block(a, self.ref_hi + 1 - a).astype(np.float32)
+        self._zero(a, self.ref_hi + 1)
+        b = a + d
+        idx = np.arange(b, b + len(seg))
+        keep = idx >= 0
+        self.ref[idx[keep] % RING] = seg[keep]
+        if d > 0:
+            pass                                   # gap [a, b) stays zero
+        self.ref_hi = b + len(seg) - 1
+        if getattr(self, "seg_r0", None) is not None and self.seg_r0 >= a - FS // 10:
+            self.seg_r0 += d
 
     def truncate(self, t: float, keep_s: float = 0.03) -> None:
         """Speaker was flushed at time t: nothing after t (+ a little in flight) will be played."""
@@ -94,7 +123,14 @@ class EchoCanceller:
         if self.debug is not None:
             self.debug.append((d.copy(), self._ref_block(r_now - self.max_delay, N + self.max_delay)[-N - 3200:]))
         # the echo delay shifts by tens of ms between replies (device buffer prefill), so track it continuously
-        if self.frames % 2 == 0:
+        sr0 = getattr(self, "seg_r0", None)
+        if (sr0 is not None and not self.seg_locked and self.delay is not None
+                and r_now + N - self.delay - sr0 >= int(0.2 * FS)):
+            # first ~200 ms of a new reply: correlate only over this reply's echo
+            span = (r_now + N - self.delay - sr0) / FS + 0.05
+            self._estimate_delay(r_now + N, win_s=min(0.5, span), force=True)
+            self.seg_locked = True
+        elif self.frames % 2 == 0:
             self._estimate_delay(r_now + N)
         if self.delay is None:
             return pcm
@@ -113,6 +149,8 @@ class EchoCanceller:
         # double-talk guard: if the residual is much bigger than the echo estimate, someone is talking: adapt slowly
         # (only once the filter has converged; before that the residual is all echo)
         mu = self.mu * (0.05 if (self.erle_db > 6 and pe > 4 * py and pe > 1e-6) else 1.0)
+        if self.freeze:                           # bridge detected double-talk (user speaking over Grok)
+            mu = 0.0
         G = mu * np.conj(X) * E / (Pf + 1e-8 + self.reg * float(np.mean(self.P)))
         g = np.real(np.fft.ifft(G))[:N]
         self.W += np.fft.fft(np.concatenate([g, np.zeros(N)]))
@@ -128,7 +166,7 @@ class EchoCanceller:
             self.res_dbg = getattr(self, "res_dbg", []); self.res_dbg.append((self.frames, e.copy(), d.copy()))
         return (np.clip(e, -1, 1) * 32767).astype("<i2").tobytes()
 
-    def _estimate_delay(self, r_end: int, win_s: float = 0.5) -> None:
+    def _estimate_delay(self, r_end: int, win_s: float = 0.5, force: bool = False) -> None:
         L = int(win_s * FS)
         mic = self.mic_hist[-L:]
         ref = self._ref_block(r_end - L - self.max_delay, L + self.max_delay)
@@ -150,5 +188,5 @@ class EchoCanceller:
         self.delay_hist = (getattr(self, "delay_hist", []) + [new])[-8:]
         # re-centre the filter window on the new delay; the learned taps stay valid relative to it
         if self.delay is None or (abs(new - self.delay) > 3 and
-                                  sum(abs(d - new) <= 3 for d in self.delay_hist[-2:]) >= 2):
+                                  (force or sum(abs(d - new) <= 3 for d in self.delay_hist[-2:]) >= 2)):
             self.delay = new

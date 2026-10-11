@@ -23,6 +23,14 @@ DEFAULTS = {
     "startup_checks": True,
     "vad_gate": True,            # send xAI silence while local Silero VAD hears no speech (noisy AGC'd mic)
     "vad_gate_preroll_ms": 600,
+    "tool_reply_protect_s": 2.5, # no barge-in during the first seconds of a spoken tool result
+    "barge_onset_s": 1.2,        # stricter barge-in margin for the first part of each reply (echo path re-locking)
+    "web_search": True,          # xAI built-in web search tool in the realtime session
+    "x_search": True,            # xAI built-in X (Twitter) search
+    # Architecture rule: non-home capabilities come from xAI's own tools; HA MCP tools are only for the home.
+    "hidden_tools": ["script__assist_search_google", "llm__GetDateTime"],   # HA MCP tools not offered to Grok
+    "hidden_tool_pattern": r"search|google|wiki|web|news|weather|ask_|llm__",  # regex on HA tool names
+    "timezone": "America/Los_Angeles",   # local time goes into the instructions at session start
     "echo_cancel": True,         # remove Grok's own voice from the mic using the exact output as reference
     # echo-aware barge-in while Grok's audio plays (see server.py)
     "barge_threshold": 0.8,      # Silero probability required during agent audio (normal gate uses 0.6)
@@ -45,9 +53,12 @@ DEFAULTS = {
         "detail or for something long like a story; then give them the length they asked for. "
         "For home control, call the Home Assistant tools right away without asking for confirmation, "
         "then confirm in a few words. After every tool call, always tell the user the result out loud. "
+        "Home Assistant tools are only for the home (devices, states, timers, lists, broadcasts). "
         "Use the area argument for rooms. For questions about device state, "
         "use GetLiveContext and answer only what was asked. Answer general questions from your own "
-        "knowledge; only use the web search script when asked to look something up online. "
+        "knowledge. You HAVE live web search and X search tools: use them for news, current events, weather, "
+        "scores, prices, recent facts, or whenever asked to look something up (X search for posts and trends on X). "
+        "Never say you can't search, browse or get current information; search instead. "
         "When the user is done or dismisses you (for example: thanks, that's all, that's it, goodbye, bye, "
         "stop listening, never mind), call the hang_up tool and say a very short goodbye. "
         "This is spoken audio: no markdown, lists or emoji."
