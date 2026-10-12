@@ -40,6 +40,8 @@ DEFAULTS = {
     # Architecture rule: non-home capabilities come from xAI's own tools; HA MCP tools are only for the home.
     "hidden_tools": ["script__assist_search_google", "llm__GetDateTime"],   # HA MCP tools not offered to Grok
     "hidden_tool_pattern": r"search|google|wiki|web|news|weather|ask_|llm__",  # regex on HA tool names
+    "ha_local_tools": True,      # find_entities / get_entity / get_history / list_automations / run_* (ha_tools.py)
+    "max_tool_steps": 8,         # consecutive tool calls per turn (LiveKit default 3 was too few)
     "memory_enabled": True,      # conversation memory: markdown files + recall_memory / remember tools
     "memory_dir": "/share/grok_voice_live/memory",
     "memory_retention_days": 180,

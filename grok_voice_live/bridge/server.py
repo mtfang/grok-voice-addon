@@ -23,6 +23,10 @@ from output_eq import OutputEQ
 from echo_cancel import EchoCanceller
 import settings
 import memory
+import ha_tools
+
+HA: "ha_tools.HAClient | None" = None          # bridge-local HA read/automation tools, see ha_tools.py
+HTTP: "object | None" = None                  # one shared aiohttp session for the xAI realtime plugin (no leaks)
 
 MEM_STORE: "memory.MemoryStore | None" = None   # conversation memory (markdown files), see memory.py
 
@@ -352,15 +356,16 @@ class FilteredMCPToolset(mcp.MCPToolset):
 
 
 def build_session(opts: dict, extra_tools: list | None = None, extra_instructions: str = "") -> tuple[AgentSession, Agent]:
-    llm = xai.realtime.RealtimeModel(model=opts["model"], voice=opts["voice"], api_key=opts["xai_api_key"])
-    ha_mcp = mcp.MCPServerHTTP(
+    llm = xai.realtime.RealtimeModel(model=opts["model"], voice=opts["voice"], api_key=opts["xai_api_key"],
+                                     **({"http_session": HTTP} if HTTP is not None else {}))
+    ha_mcp = ha_tools.clean_mcp_server_class(mcp.MCPServerHTTP)(
         url=opts["ha_url"].rstrip("/") + "/api/mcp", transport_type="streamable_http",
         headers={"Authorization": "Bearer " + opts["ha_token"]},
         timeout=10, client_session_timeout_seconds=20,
     )
     # XMOS does hardware AEC on the device, so LiveKit's software AEC warm-up (which blocks barge-in for
     # the first 3 s of each reply) is shortened.
-    session = AgentSession(llm=llm, user_away_timeout=None,
+    session = AgentSession(llm=llm, user_away_timeout=None, max_tool_steps=int(opts["max_tool_steps"]),
                            aec_warmup_duration=float(opts["aec_warmup_s"]) or None)
     tools: list = [FilteredMCPToolset(id="home_assistant", mcp_server=ha_mcp, hidden=set(opts["hidden_tools"]),
                                       pattern=opts["hidden_tool_pattern"])]
@@ -684,7 +689,9 @@ class Connection:
             except Exception:
                 log.exception("memory context"); ctx = ""
             mem_text = memory.MEMORY_GUIDE + (" " + ctx if ctx else "")
-        session, agent = build_session(o, [hang_up, *(mem.tools() if mem else [])], mem_text)
+        ha_extra = ha_tools.make_tools(HA) if HA is not None else []
+        session, agent = build_session(o, [hang_up, *(mem.tools() if mem else []), *ha_extra],
+                                       mem_text + (ha_tools.HA_GUIDE if ha_extra else ""))
         inp = QueueAudioInput()
         in_stats = AudioStats("in<-device")
         in_fmt = {"rate": 16000, "width": 2, "channels": 1}
@@ -1209,7 +1216,9 @@ async def startup_checks(opts: dict) -> None:
                 log.info("live agent tools: HA (home only) %d, hidden from the agent: %s; xAI server tools: %s",
                          len(tools.tools) - len(hid), ", ".join(hid) or "none",
                          ", ".join(n for n in ("web_search", "x_search") if opts[n]) or "none")
-                log.info("live agent local tools: hang_up%s", ", recall_memory, remember" if opts["memory_enabled"] else "")
+                log.info("live agent local tools: hang_up%s%s; max tool steps %d", ", recall_memory, remember" if opts["memory_enabled"] else "",
+                         ", find_entities, get_entity, get_history, list_automations, run_automation, run_script, "
+                         "toggle_automation" if opts["ha_local_tools"] else "", int(opts["max_tool_steps"]))
     except BaseException as e:  # noqa: BLE001 (anyio ExceptionGroup)
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
@@ -1243,6 +1252,18 @@ async def main() -> None:
                  ", ".join(f"{k} {fc:g}Hz {g:+g}dB Q{q:g}" for k, fc, g, q in e.filters), e.ceiling_db)
     else:
         log.info("output EQ off; output %d Hz", int(opts["output_rate"]))
+    global HA, HTTP
+    import aiohttp
+    HTTP = aiohttp.ClientSession()
+    if opts["ha_local_tools"]:
+        HA = ha_tools.HAClient(opts["ha_url"], opts["ha_token"], opts["timezone"])
+        try:
+            idx = await HA.index()
+            log.info("HA local tools: %d entities indexed (%d automations, %d scripts, %d with an area)", len(idx),
+                     sum(e["domain"] == "automation" for e in idx), sum(e["domain"] == "script" for e in idx),
+                     sum(bool(e["area"]) for e in idx))
+        except Exception as e:
+            log.warning("HA local tools: index check failed (%r); tools stay on and retry per call", e)
     if opts["memory_enabled"]:
         global MEM_STORE
         try:
