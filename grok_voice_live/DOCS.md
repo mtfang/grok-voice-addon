@@ -150,3 +150,17 @@ and every log line is tagged `[device-name]`.
   echo is the loudest output of the reply so far (lag ignored), and the onset margin is 12 dB (`barge_onset_extra_db`).
   Interruptions in the first 2 s of a reply need to be clearly louder than Grok; later ones are unchanged.
 - `debug_ring_s` up to 180 s; the per-second "while playing" debug line shows the cleaned-signal Silero maximum.
+
+## 0.4.7: full-home read tools and automations
+
+HA's MCP server only sees Assist-exposed entities, so the bridge adds its own home tools (REST + WebSocket API,
+the add-on's non-admin token, `ha_local_tools: true`):
+
+- `find_entities(query, domain, area)`: fuzzy search over ALL entities (names, aliases, areas, devices; "outdoor"
+  also matches porch/backyard/carport/...), up to 15 real entity_ids with name, area, state, unit.
+- `get_entity(entity_id)`, `get_history(entity_id, hours=24)` (min/max/avg or state changes), `list_automations()`
+  (automations and scripts with last triggered, PT).
+- `run_automation`, `run_script`, `toggle_automation`: only existing automation/script ids, and only with
+  `confirmed=true` after the user said yes (otherwise the tool answers "ask the user to confirm").
+- `max_tool_steps` (8) consecutive tool calls per turn; empty/"None" arguments are dropped before HA MCP calls;
+  one shared HTTP session for the xAI plugin (fixes "Unclosed client session").
