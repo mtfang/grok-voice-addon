@@ -15,7 +15,7 @@ substitutions:
   friendly_name: Satellite Living Room   # device's current friendly name (keeps entity names)
   log_level: info
   esp32_fw_version: v0.2.1
-  xmos_fw_version: "v1.0.3-dev.1"   # rawtap XMOS image (FPH v1.0.3 + raw mic tap)
+  xmos_fw_version: "v1.0.3-dev.2"   # rawtap XMOS image (FPH v1.0.3 + raw mic tap)
   fph_ref: v0.2.1
 
   # Grok Voice Live add-on on the HA host (port 10700/tcp). Use the HA host's LAN IP.
@@ -196,8 +196,8 @@ memory_flasher:
     id: xflash
     embed_flash_image:
       image_version: ${xmos_fw_version}
-      image_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.1/satellite1_rawtap.factory.bin.b64
-      md5_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.1/satellite1_rawtap.factory.md5
+      image_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.2/satellite1_rawtap.factory.bin.b64
+      md5_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.2/satellite1_rawtap.factory.md5
     on_flashing_start:
       then:
         - lambda: id(xmos_flashing_state) = 1;
@@ -267,7 +267,7 @@ micro_wake_word:
   microphone:
     microphone: sat1_mics
     channels: 1
-    gain_factor: 6
+    gain_factor: 1   # rawtap dev.2: XMOS applies x6 to ch1 before 16-bit truncation
   stop_after_detection: false
   on_wake_word_detected:
     - if:
@@ -522,7 +522,7 @@ grok_stream:
   microphone:
     microphone: sat1_mics
     channels: 1                 # XMOS ch1 = AEC+IC+NS without AGC (ch0's AGC pumps residual echo up)
-    gain_factor: 6              # fixed gain, like micro_wake_word on ch1; fine-tune with the add-on's input_gain_db
+    gain_factor: 1              # rawtap dev.2: XMOS applies x6 to ch1 (same level as stock gain_factor 6)
   speaker: grok_resampling_speaker
   idle_timeout: 30s             # no bytes from the add-on for 30 s (it pings every 5 s) -> hang up
   max_duration: 660s            # safety net only; the add-on decides (dismissal / idle_timeout_s / max_session_s 600)

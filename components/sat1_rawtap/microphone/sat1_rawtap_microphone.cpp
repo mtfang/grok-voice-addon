@@ -10,6 +10,8 @@
 #include <cstring>
 #include <esp_heap_caps.h>
 #include <esp_rom_crc.h>
+#include <esp_timer.h>
+#include <driver/i2s_std.h>
 
 namespace esphome {
 namespace i2s_audio {
@@ -163,6 +165,18 @@ void Sat1RawtapMicrophone::loop() {
              (unsigned) this->cap_unlocked_.load());
     this->start_dump(0);
   }
+  // sync-loss diagnostics: log each record once its relock is known (or after 1 s)
+  while (this->loss_rd_ < this->loss_wr_.load()) {
+    if (this->loss_wr_.load() - this->loss_rd_ > LOSS_RING) this->loss_rd_ = this->loss_wr_.load() - LOSS_RING;
+    LossRec lr = this->loss_ring_[this->loss_rd_ % LOSS_RING];
+    if (lr.phase_delta < 0 && esp_timer_get_time() - lr.t_us < 1000000) break;
+    ESP_LOGW(RT_TAG, "sync loss #%u: word %u/%u of read, read gap %u us (max %u), rx_dma_ovf %u%s, short reads %u, "
+             "relock phase delta %d after %u triplets",
+             (unsigned) (this->loss_rd_ + 1), (unsigned) lr.word_idx, (unsigned) lr.n_words, (unsigned) lr.read_gap_us,
+             (unsigned) this->max_read_gap_us_, (unsigned) lr.ovf, this->ovf_cb_registered_ ? "" : " (cb n/a)",
+             (unsigned) lr.short_reads, (int) lr.phase_delta, (unsigned) lr.unlocked_triplets);
+    this->loss_rd_++;
+  }
   this->sweep_step_();
   this->dump_step_();
 }
@@ -181,10 +195,29 @@ void Sat1RawtapMicrophone::configure_stream_settings_() {
   this->audio_stream_info_ = audio::AudioStreamInfo(bits_per_sample, channel_count, 16000);
 }
 
+bool Sat1RawtapMicrophone::rx_ovf_cb_(void *handle, void *event, void *user) {
+  ((Sat1RawtapMicrophone *) user)->rx_ovf_++;
+  return false;
+}
+
 bool Sat1RawtapMicrophone::start_driver_() {
   if (!this->start_i2s_channel_()) {
     ESP_LOGE(TAG, "Failed to start I2S channel");
     return false;
+  }
+  this->last_read_us_ = 0;
+  {
+    // rawtap diagnostics: count RX DMA queue overflows (callbacks can only be registered while disabled)
+    i2s_chan_handle_t rx = this->parent_->get_rx_handle();
+    i2s_event_callbacks_t cbs = {};
+    cbs.on_recv_q_ovf = (i2s_isr_callback_t) &Sat1RawtapMicrophone::rx_ovf_cb_;
+    esp_err_t e1 = i2s_channel_disable(rx);
+    esp_err_t e2 = i2s_channel_register_event_callback(rx, &cbs, this);
+    esp_err_t e3 = i2s_channel_enable(rx);
+    this->ovf_cb_registered_ = (e2 == ESP_OK);
+    if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK)
+      ESP_LOGW(RT_TAG, "RX ovf callback: disable=%s register=%s enable=%s", esp_err_to_name(e1), esp_err_to_name(e2),
+               esp_err_to_name(e3));
   }
   this->configure_stream_settings_();  // redetermine the settings in case some settings were changed after compilation
   return true;
@@ -252,6 +285,16 @@ void Sat1RawtapMicrophone::mic_task(void *params) {
       if (this_microphone->data_callbacks_.size() > 0) {
         samples.resize(bytes_to_read);
         size_t bytes_read = this_microphone->read_(samples.data(), bytes_to_read, 2 * pdMS_TO_TICKS(READ_DURATION_MS));
+        {
+          int64_t now = esp_timer_get_time();
+          if (this_microphone->last_read_us_ != 0) {
+            uint32_t gap = (uint32_t) (now - this_microphone->last_read_us_);
+            this_microphone->cur_read_gap_us_ = gap;
+            if (gap > this_microphone->max_read_gap_us_) this_microphone->max_read_gap_us_ = gap;
+          }
+          this_microphone->last_read_us_ = now;
+          if (bytes_read < bytes_to_read) this_microphone->short_reads_++;
+        }
         size_t samples_read = bytes_read / sizeof(int32_t);
         int32_t *samples_32 = reinterpret_cast<int32_t *>(samples.data());
         size_t pairs = this_microphone->decode_(samples_32, samples_read);
@@ -331,6 +374,19 @@ size_t Sat1RawtapMicrophone::decode_(int32_t *words, size_t n_words) {
           this->locked_.store(false);
           this->lock_losses_++;
           this->bad_triplets_ = 0;
+          this->phase_before_loss_ = p;
+          this->unlocked_triplets_ = 0;
+          uint32_t w = this->loss_wr_.load();
+          LossRec &lr = this->loss_ring_[w % LOSS_RING];
+          lr.t_us = esp_timer_get_time();
+          lr.word_idx = (uint32_t) i;
+          lr.n_words = (uint32_t) n_words;
+          lr.read_gap_us = this->cur_read_gap_us_;
+          lr.ovf = this->rx_ovf_.load();
+          lr.short_reads = this->short_reads_.load();
+          lr.unlocked_triplets = 0;
+          lr.phase_delta = -1;
+          this->loss_wr_.store(w + 1);
         }
       } else {
         this->bad_triplets_ = 0;
@@ -362,7 +418,11 @@ size_t Sat1RawtapMicrophone::decode_(int32_t *words, size_t n_words) {
       // stock-compatible output while unlocked (stock XMOS repeats each sample 3x on both channels)
       if (k == 0) {
         words[2 * out] = l;
-        words[2 * out + 1] = (int32_t) r;
+        // after a rawtap sync loss, mute ch1 (the R word carries packed data) until relock; fall back to the stock
+        // R channel only if no rawtap sync was seen for ~1 s (i.e. the XMOS runs stock firmware)
+        const bool mute = this->lock_events_.load(std::memory_order_relaxed) > 0 && this->unlocked_triplets_ < 16000;
+        words[2 * out + 1] = mute ? 0 : (int32_t) r;
+        this->unlocked_triplets_++;
         out++;
         this->unlocked_samples_++;
         if (this->capturing_.load(std::memory_order_relaxed)) {
@@ -383,6 +443,13 @@ size_t Sat1RawtapMicrophone::decode_(int32_t *words, size_t n_words) {
         if (this->cand_run_[p] >= RAWTAP_LOCK_TRIPLETS) {
           this->phase_ = p;
           this->bad_triplets_ = 0;
+          if (this->lock_events_.load() > 0 && this->loss_wr_.load() > 0) {
+            LossRec &lr = this->loss_ring_[(this->loss_wr_.load() - 1) % LOSS_RING];
+            if (lr.phase_delta < 0) {
+              lr.phase_delta = (int8_t) ((p + 3 - this->phase_before_loss_) % 3);
+              lr.unlocked_triplets = this->unlocked_triplets_;
+            }
+          }
           this->lock_events_++;
           this->locked_.store(true);
           break;
@@ -396,8 +463,8 @@ size_t Sat1RawtapMicrophone::decode_(int32_t *words, size_t n_words) {
 std::string Sat1RawtapMicrophone::tap_status() const {
   char buf[96];
   if (this->locked_.load()) {
-    snprintf(buf, sizeof(buf), "rawtap locked (locks %u, losses %u)", (unsigned) this->lock_events_.load(),
-             (unsigned) this->lock_losses_.load());
+    snprintf(buf, sizeof(buf), "rawtap locked (locks %u, losses %u, dma ovf %u)", (unsigned) this->lock_events_.load(),
+             (unsigned) this->lock_losses_.load(), (unsigned) this->rx_ovf_.load());
   } else if (this->lock_events_.load() == 0) {
     snprintf(buf, sizeof(buf), "stock decode (no rawtap sync)");
   } else {

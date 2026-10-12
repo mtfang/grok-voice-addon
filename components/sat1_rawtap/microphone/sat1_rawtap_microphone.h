@@ -78,6 +78,29 @@ class Sat1RawtapMicrophone : public I2SAudioIn, public microphone::Microphone, p
 
   // decoder state (mic task only, except the atomics)
   std::vector<int32_t> scratch_;
+  // sync-loss diagnostics (written by mic task, logged by loop)
+  struct LossRec {
+    int64_t t_us;
+    uint32_t word_idx, n_words, read_gap_us, ovf, short_reads, unlocked_triplets;
+    int8_t phase_delta;  // set on relock: (new - old) phase mod 3, -1 = not yet relocked
+  };
+  static const uint8_t LOSS_RING = 16;
+  LossRec loss_ring_[LOSS_RING]{};
+  std::atomic<uint32_t> loss_wr_{0};
+  uint32_t loss_rd_{0};
+  uint8_t phase_before_loss_{0};
+  uint32_t unlocked_triplets_{0};
+  uint32_t cur_word_idx_{0};
+  uint32_t cur_n_words_{0};
+  uint32_t cur_read_gap_us_{0};
+  uint32_t max_read_gap_us_{0};
+  int64_t last_read_us_{0};
+  std::atomic<uint32_t> short_reads_{0};
+  std::atomic<uint32_t> rx_ovf_{0};
+  bool ovf_cb_registered_{false};
+ public:
+  static bool rx_ovf_cb_(void *handle, void *event, void *user);
+ protected:
   int32_t cur_l_{0};
   bool have_l_{false};
   uint8_t k3_{0};
