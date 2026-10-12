@@ -40,6 +40,10 @@ DEFAULTS = {
     # Architecture rule: non-home capabilities come from xAI's own tools; HA MCP tools are only for the home.
     "hidden_tools": ["script__assist_search_google", "llm__GetDateTime"],   # HA MCP tools not offered to Grok
     "hidden_tool_pattern": r"search|google|wiki|web|news|weather|ask_|llm__",  # regex on HA tool names
+    "memory_enabled": True,      # conversation memory: markdown files + recall_memory / remember tools
+    "memory_dir": "/share/grok_voice_live/memory",
+    "memory_retention_days": 180,
+    "memory_model": "grok-4.20-non-reasoning",   # cheap text model for the end-of-session summary
     "timezone": "America/Los_Angeles",   # local time goes into the instructions at session start
     "echo_cancel": True,         # remove Grok's own voice from the mic using the exact output as reference
     # echo-aware barge-in while Grok's audio plays (see server.py)

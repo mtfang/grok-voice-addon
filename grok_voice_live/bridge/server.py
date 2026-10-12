@@ -22,6 +22,9 @@ from protocol import read_event, encode_event, ProtocolError
 from output_eq import OutputEQ
 from echo_cancel import EchoCanceller
 import settings
+import memory
+
+MEM_STORE: "memory.MemoryStore | None" = None   # conversation memory (markdown files), see memory.py
 
 log = logging.getLogger("grok-bridge")
 import contextvars
@@ -348,7 +351,7 @@ class FilteredMCPToolset(mcp.MCPToolset):
         return self
 
 
-def build_session(opts: dict, extra_tools: list | None = None) -> tuple[AgentSession, Agent]:
+def build_session(opts: dict, extra_tools: list | None = None, extra_instructions: str = "") -> tuple[AgentSession, Agent]:
     llm = xai.realtime.RealtimeModel(model=opts["model"], voice=opts["voice"], api_key=opts["xai_api_key"])
     ha_mcp = mcp.MCPServerHTTP(
         url=opts["ha_url"].rstrip("/") + "/api/mcp", transport_type="streamable_http",
@@ -372,6 +375,7 @@ def build_session(opts: dict, extra_tools: list | None = None) -> tuple[AgentSes
     except Exception:
         when = datetime.datetime.now().astimezone().strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
     instructions = opts["instructions"] + f" The current local date and time at the start of this conversation is {when}."
+    instructions += extra_instructions
     log.info("xAI server tools: %s", ", ".join(n for n, on in (("web_search", opts["web_search"]),
                                                                   ("x_search", opts["x_search"])) if on) or "none")
     agent = Agent(instructions=instructions, tools=[*tools, *(extra_tools or [])])
@@ -610,7 +614,15 @@ class Connection:
                 log.info("hang_up requested by the model")
             return "The session will end now. Say a very short goodbye (two to four words) and nothing else."
 
-        session, agent = build_session(o, [hang_up])
+        mem = memory.SessionMemory(MEM_STORE, o, self.device) if MEM_STORE is not None else None
+        mem_text = ""
+        if mem is not None:
+            try:
+                ctx = MEM_STORE.prompt_context()
+            except Exception:
+                log.exception("memory context"); ctx = ""
+            mem_text = memory.MEMORY_GUIDE + (" " + ctx if ctx else "")
+        session, agent = build_session(o, [hang_up, *(mem.tools() if mem else [])], mem_text)
         inp = QueueAudioInput()
         in_stats = AudioStats("in<-device")
         in_fmt = {"rate": 16000, "width": 2, "channels": 1}
@@ -720,6 +732,8 @@ class Connection:
             it = ev.item
             if getattr(it, "type", None) == "message" and it.text_content:
                 log.info("%s: %s", it.role, it.text_content)
+                if mem is not None:
+                    mem.add(it.role, it.text_content)
                 self.send("transcript", {"role": it.role, "text": it.text_content[:500]})
 
         @session.on("function_tools_executed")
@@ -1058,6 +1072,8 @@ class Connection:
             except Exception:
                 log.exception("session close")
             log.info("session closed for %s: %s after %.1fs", self.peer, self.end_reason, time.monotonic() - t0)
+            if mem is not None:
+                memory.spawn(mem.finish())        # summary + markdown file, in the background
 
 
 async def startup_checks(opts: dict) -> None:
@@ -1092,6 +1108,7 @@ async def startup_checks(opts: dict) -> None:
                 log.info("live agent tools: HA (home only) %d, hidden from the agent: %s; xAI server tools: %s",
                          len(tools.tools) - len(hid), ", ".join(hid) or "none",
                          ", ".join(n for n in ("web_search", "x_search") if opts[n]) or "none")
+                log.info("live agent local tools: hang_up%s", ", recall_memory, remember" if opts["memory_enabled"] else "")
     except BaseException as e:  # noqa: BLE001 (anyio ExceptionGroup)
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
@@ -1125,6 +1142,19 @@ async def main() -> None:
                  ", ".join(f"{k} {fc:g}Hz {g:+g}dB Q{q:g}" for k, fc, g, q in e.filters), e.ceiling_db)
     else:
         log.info("output EQ off; output %d Hz", int(opts["output_rate"]))
+    if opts["memory_enabled"]:
+        global MEM_STORE
+        try:
+            MEM_STORE = memory.MemoryStore(opts["memory_dir"], opts["timezone"], int(opts["memory_retention_days"]))
+            n = len(MEM_STORE.conversations())
+            log.info("memory on: %s (%d conversations, %d facts, keep %d days, summaries by %s)", opts["memory_dir"],
+                     n, len(MEM_STORE.facts_tail(10_000)), MEM_STORE.retention_days, opts["memory_model"])
+            asyncio.get_running_loop().create_task(memory.prune_loop(MEM_STORE))
+        except Exception:
+            log.exception("memory disabled: cannot use %s", opts["memory_dir"])
+            MEM_STORE = None
+    else:
+        log.info("memory off")
     if opts["startup_checks"]:
         await startup_checks(opts)
 
