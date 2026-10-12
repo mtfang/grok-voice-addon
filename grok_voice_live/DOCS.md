@@ -107,3 +107,14 @@ and every log line is tagged `[device-name]`.
   are smoothed (median of 7) instead of shifting the echo reference on every marker.
 - **Logs**: startup shows the live agent's tools (HA home tools, hidden ones, xAI web/X search); a device-ended
   session logs `client_stop (<reason>)` (action_button, ha_switch_off, device_idle_timeout, stand_down, ...).
+
+## 0.4.3
+
+- **Barge-in retuned for XMOS ch1** (no AGC: echo coupling about -13 dB instead of +2..+3 dB on the AGC channel).
+  The echo model now starts from `barge_echo_init_db` -10 dB and a -45 dBFS noise floor (`barge_noise_init_db`)
+  instead of +3 dB / -30 dBFS, which predicted an echo 16 dB louder than the real one and rejected every real
+  interruption until the model re-fitted. `barge_min_speech_ms` 288 -> 224, `barge_margin_db` 4 -> 3.
+  Offline replay on ch1-like audio (tests/offline_barge_ch1.py, no xAI): interruptions caught 0/72 before,
+  59/72 after (median ~0.35 s), no self-interruptions on Grok-only audio.
+- The learned echo lag/coupling/noise per device is kept in `/data/echo_state.json` across add-on restarts.
+- Session summary splits rejected echo candidates into "too short" and "not above echo".

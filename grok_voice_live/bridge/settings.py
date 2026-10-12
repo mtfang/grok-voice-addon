@@ -44,11 +44,13 @@ DEFAULTS = {
     "echo_cancel": True,         # remove Grok's own voice from the mic using the exact output as reference
     # echo-aware barge-in while Grok's audio plays (see server.py)
     "barge_threshold": 0.8,      # Silero probability required during agent audio (normal gate uses 0.6)
-    "barge_min_speech_ms": 288,  # sustained speech needed to interrupt
-    "barge_margin_db": 4.0,      # a frame counts as "user" when the mic is this far above the predicted echo
+    "barge_min_speech_ms": 224,  # sustained speech needed to interrupt (288 before 0.4.3, tuned on AGC'd ch0)
+    "barge_margin_db": 3.0,      # a frame counts as "user" when the mic is this far above the predicted echo
     "barge_onset_extra_db": 8.0, # extra margin during the first 0.8 s of each reply
     "barge_frac": 0.4,           # share of frames in the barge window that must count as "user"
-    "barge_echo_init_db": 3.0,   # starting echo coupling (mic dBFS minus output dBFS); learned per device
+    "barge_echo_init_db": -10.0, # starting echo coupling (mic dBFS minus output dBFS); learned per device and
+                                 # kept across restarts. XMOS ch1 (no AGC) measures -13..-17 dB (+2..+3 on AGC'd ch0)
+    "barge_noise_init_db": -45.0, # starting mic noise floor (ch1 + 24 dB input gain: -46 dBFS); learned per device
     "echo_tail_ms": 350,         # treat this long after playback ends as still echo-prone
     "input_gain_db": 0.0,        # software gain on device mic audio before it goes to xAI
     "debug_dump_s": 0,           # >0: write the first N s of inbound (device mic) audio to a WAV

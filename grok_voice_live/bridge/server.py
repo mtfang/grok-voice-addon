@@ -11,7 +11,7 @@ or `idle_timeout_s` passes with nobody talking (never while a tool call or its s
 at `max_session_s`.
 """
 from __future__ import annotations
-import asyncio, collections, datetime, hmac, logging, math, os, time, wave
+import asyncio, collections, datetime, hmac, json, logging, math, os, time, wave
 import numpy as np
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, function_tool, mcp
@@ -461,7 +461,35 @@ class EchoModel:
 ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # device -> (lag s, coupling dB, noise floor dBFS)
 ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # device -> canceller (learned echo path survives sessions)
 ACTIVE: dict[str, asyncio.Task] = {}
-ECHO_PEAK: dict[str, float] = {}                          # device -> loudest echo coupling seen (dB)                      # device -> its running session task
+ECHO_PEAK: dict[str, float] = {}                          # device -> loudest echo coupling seen (dB)
+ECHO_STATE_FILE = os.environ.get("GROK_ECHO_STATE_FILE", "/data/echo_state.json")
+
+
+def _load_echo_state() -> None:
+    """Learned echo lag/coupling/noise per device survive add-on restarts (the first reply after a restart
+    otherwise starts from the defaults, which made barge-in impossible until the echo model re-fitted)."""
+    try:
+        with open(ECHO_STATE_FILE) as f:
+            d = json.load(f)
+        for dev, v in d.items():
+            ECHO_STATE[dev] = (float(v["lag"]), float(v["coupling"]), float(v["noise"]))
+            ECHO_PEAK[dev] = float(v.get("peak", -40.0))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("echo state %s not loaded: %r", ECHO_STATE_FILE, e)
+
+
+def _save_echo_state() -> None:
+    try:
+        d = {dev: {"lag": s[0], "coupling": s[1], "noise": s[2], "peak": ECHO_PEAK.get(dev, -40.0)}
+             for dev, s in ECHO_STATE.items()}
+        tmp = ECHO_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, ECHO_STATE_FILE)
+    except Exception as e:
+        log.debug("echo state not saved: %r", e)
 
 
 class WakeArbiter:
@@ -594,14 +622,14 @@ class Connection:
         use_gate = bool(o["vad_gate"])
         gate = {"open": not use_gate, "opened": 0}
         # Echo-aware barge-in. While Grok's audio is playing (and `echo_tail_ms` after), residual speaker echo
-        # in the XMOS-processed mic signal (measured on satellite1-d98894 at about -17..-22 dBFS RMS, as loud as
-        # the user's own speech, because the XMOS AGC boosts it) is loud enough for Silero to call it speech. So
+        # in the XMOS-processed mic signal (on AGC'd ch0 about -17..-22 dBFS RMS, as loud as the user's own speech;
+        # on ch1 without AGC the coupling is about -13 dB, 0.4.3 retune) is loud enough for Silero to call speech. So
         # in that window the gate toward xAI stays shut and the bridge only interrupts when Silero is confident
         # for `barge_min_speech_ms` AND the mic is `barge_margin_db` above the expected echo (output envelope at
         # the estimated play time + a learned echo coupling) and above the noise floor.
         echo = {"cand": [], "low": 0, "rejected": 0,
                 "fired": 0, "speaking": False, "mic_db": -120.0, "barging": False, "barge_t": 0.0,
-                "start_in_echo": False, "max_rej": -99.0}
+                "start_in_echo": False, "max_rej": -99.0, "rej_short": 0, "rej_echo": 0}
         tail_s = float(o["echo_tail_ms"]) / 1000.0
         busy = {"tools": set(), "reply_wait_since": None, "last_gen": 0.0, "last_act": time.monotonic()}
         preroll: collections.deque = collections.deque(maxlen=max(1, int(o["vad_gate_preroll_ms"]) // 32))
@@ -643,7 +671,8 @@ class Connection:
         out = DeviceAudioOutput(self.send, lead_s=o["out_lead_ms"] / 1000.0, device_rate=rate, eq=eq, ec=ec)
         out.gain = out_gain
         session.input.audio, session.output.audio = inp, out
-        lag0, coup0, noise0 = ECHO_STATE.get(self.device, (0.15, float(o["barge_echo_init_db"]), -30.0))
+        lag0, coup0, noise0 = ECHO_STATE.get(self.device, (0.15, float(o["barge_echo_init_db"]),
+                                                            float(o["barge_noise_init_db"])))
         em = EchoModel(out, lag0, coup0, noise0)
         em.peak = ECHO_PEAK.get(self.device, -40.0) - 2.0   # last session's loudness, decayed a little
 
@@ -890,8 +919,11 @@ class Connection:
                             w = echo["cand"][-min_frames:]
                             frac = sum(1 for x in w if x[1] >= x[2]) / len(w)
                             echo["max_rej"] = max(echo["max_rej"], frac)
-                            log.debug("echo candidate rejected: %d frames, %.0f%% above echo+margin, median %.1f dB",
-                                      len(echo["cand"]), 100 * frac, float(np.median([x[1] for x in w])))
+                            short = len(echo["cand"]) < min_frames
+                            echo["rej_short" if short else "rej_echo"] += 1
+                            log.debug("echo candidate rejected (%s): %d frames, %.0f%% above echo+margin, median %.1f dB",
+                                      "too short" if short else "not above echo", len(echo["cand"]), 100 * frac,
+                                      float(np.median([x[1] for x in w])))
                         echo["cand"].clear()
                 if len(echo["cand"]) < min_frames:
                     continue
@@ -984,6 +1016,7 @@ class Connection:
             rtask.cancel(); ktask.cancel(); wtask.cancel()
             ECHO_STATE[self.device] = (em.lag, em.coupling, em.noise)
             ECHO_PEAK[self.device] = em.peak
+            _save_echo_state()
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -1011,8 +1044,10 @@ class Connection:
                 log.info("echo canceller: bulk delay %s ms, ERLE %.1f dB (gcc peak %.0f)",
                          f"{ec.delay / 16:.0f}" if ec.delay is not None else "?", ec.erle_db, ec.gcc_peak)
             log.info("echo: lag %.0f ms, coupling %+.1f dB (fits %d, corr %.2f), noise floor %.1f dBFS; barge-ins %d, "
-                     "echo candidates rejected %d (worst: %.0f%% of frames above echo+%.1f dB; needs %.0f%%)",
+                     "echo candidates rejected %d (%d too short, %d not above echo; worst: %.0f%% of frames above echo+%.1f dB; "
+                     "needs %.0f%%)",
                      em.lag * 1000, em.coupling, em.fits, em.corr, em.noise, echo["fired"], echo["rejected"],
+                     echo["rej_short"], echo["rej_echo"],
                      100 * max(0.0, echo["max_rej"]), margin, 100 * max(float(o["barge_frac"]), float(o["barge_frac_floor"])))
             log.info("%s; audio from xAI %d B (24 kHz)", out.stats.summary(), out.from_xai_bytes)
             if eq is not None and (eq.limited_blocks or eq.clipped_samples):
@@ -1075,6 +1110,10 @@ async def main() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("livekit.plugins.openai").setLevel(os.environ.get("LIVEKIT_LOG_LEVEL", "WARNING"))
     log.info("options: %s", settings.redacted(opts))
+    _load_echo_state()
+    if ECHO_STATE:
+        log.info("echo state restored for %s", ", ".join(f"{d} (coupling {s[1]:+.1f} dB, noise {s[2]:.1f} dBFS)"
+                                                       for d, s in ECHO_STATE.items()))
     global EQ_PRESET
     preset = opts["eq_preset_file"] or os.path.join(os.path.dirname(os.path.abspath(__file__)), "eq", "satellite1_eq_preset.txt")
     with open(preset) as f:

@@ -10,5 +10,5 @@ COPY bridge/ /app/bridge/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
-LABEL io.hass.type="addon" io.hass.version="0.4.2"
+LABEL io.hass.type="addon" io.hass.version="0.4.3"
 CMD ["/run.sh"]

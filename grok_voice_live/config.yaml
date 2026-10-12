@@ -1,6 +1,6 @@
 # No `image:` key -> Supervisor builds this add-on locally from the Dockerfile.
 name: Grok Voice Live
-version: "0.4.2"
+version: "0.4.3"
 slug: grok_voice_live
 description: Live speech-to-speech Grok (xAI realtime) bridge for Satellite1 devices, with Home Assistant MCP tools
 url: https://github.com/mtfang/grok-voice-addon
