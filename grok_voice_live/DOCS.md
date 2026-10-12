@@ -118,3 +118,15 @@ and every log line is tagged `[device-name]`.
   59/72 after (median ~0.35 s), no self-interruptions on Grok-only audio.
 - The learned echo lag/coupling/noise per device is kept in `/data/echo_state.json` across add-on restarts.
 - Session summary splits rejected echo candidates into "too short" and "not above echo".
+
+## 0.4.4: conversation memory
+
+- Each conversation is saved on the HA server as markdown in `memory_dir` (default
+  `/share/grok_voice_live/memory`, reachable via Samba / File editor): `YYYY-MM-DD_HHMM_<device>.md` with
+  front matter (date/time, device, duration), a 3-6 bullet summary (one cheap xAI text call after the session
+  closed, `memory_model`, skipped below 2 user turns) and the condensed transcript. Durable facts go to `facts.md`.
+- Tools for the live agent: `recall_memory(query, days=30)` (BM25 keyword search over summaries, transcripts and
+  facts; top 3 with dates, at most 1500 chars) and `remember(fact)`. The last 20 facts plus a one-line pointer
+  to the latest conversation are added to the instructions at session start.
+- Options: `memory_enabled` (true), `memory_retention_days` (180, pruned daily), `memory_dir`, `memory_model`.
+- Memory never leaves the HA server (it is not part of this repository; edit or delete the files freely).
