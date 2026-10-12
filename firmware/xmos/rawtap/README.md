@@ -17,10 +17,18 @@ factory image bit-identically (md5 5f5788ecb240082f61acd36f247ea3b2).
   text; the forked `components/memory_flasher` decodes it at compile time. md5 is of the binary image.
 * Reference codec + self-test: `rawtap_codec.py`.
 
+## XMOS image `v1.0.3-dev.2` (current)
+Same as dev.1 plus `-DFPH_RAW_TAP_CH1_GAIN=6 -DFPH_RAW_TAP_MIC_SHIFT=2`: ch1 gets a saturating x6 gain before the
+16-bit truncation (identical level to the stock path's ESPHome `gain_factor: 6`, so the YAML now uses
+`gain_factor: 1` for micro_wake_word and grok_stream), raw mics get a saturating <<2 (+12 dB).
+md5 748f9823276cd389ffd0344712a15e75.
+
 ## ESPHome side
 * `components/sat1_rawtap` — microphone platform (fork of FPH v0.2.1 `satellite1` microphone): locks onto the
   marker (32 triplets), outputs the usual 2-channel 16 kHz stream (ch0, ch1 = decoded 16-bit AEC+IC+NS) so
-  voice_assistant / micro_wake_word / grok_stream are unchanged; falls back to stock decoding if no marker.
+  voice_assistant / micro_wake_word / grok_stream are unchanged; falls back to stock decoding if no marker for ~1 s;
+  ch1 is muted while re-locking after a sync loss. Sync losses are logged (`rawtap` tag) with read gap, RX DMA
+  overflow count and the relock phase delta.
   Capture: `start_capture(ms, sweep, dbfs)` -> PSRAM, then base64 `RTH/RTD/RTE` log lines (tag `rawtap`).
 * `components/memory_flasher` — FPH v0.2.1 memory_flasher + base64 image support.
 * `firmware/satellite1-rawtap.yaml` — test config (placeholders for key/token/IP).
