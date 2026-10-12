@@ -1,0 +1,615 @@
+# Satellite1 (satellite1-d98894, living room) + Grok live speech-to-speech.
+# RAWTAP TEST BUILD: XMOS rawtap image + sat1_rawtap microphone decoder + capture buttons (branch rawtap).
+# Based on FutureProofHomes satellite1-esphome v0.2.1 (config/satellite1.dashboard.yaml + satellite1.base.yaml).
+# The upstream voice_assistant package is inlined below (unchanged except the wake word routing), because
+# ESPHome package merging concatenates automation lists and cannot replace on_wake_word_detected.
+#
+# Wake word: "Hey Grok" is the only active wake word (hey_jarvis / okay_nabu stay compiled but are disabled at boot
+# and ignored if re-enabled).
+#   "Grok live voice" switch ON (default): Hey Grok -> grok_stream live session (full duplex, barge-in)
+#   switch OFF:                            Hey Grok -> stock Home Assistant Assist pipeline (turn-based)
+# Center button = stock Assist; during a live Grok conversation it ends the conversation instead.
+
+substitutions:
+  name: satellite1-d98894
+  friendly_name: Satellite Living Room   # device's current friendly name (keeps entity names)
+  log_level: info
+  esp32_fw_version: v0.2.1
+  xmos_fw_version: "v1.0.3-dev.1"   # rawtap XMOS image (FPH v1.0.3 + raw mic tap)
+  fph_ref: v0.2.1
+
+  # Grok Voice Live add-on on the HA host (port 10700/tcp). Use the HA host's LAN IP.
+  grok_bridge_host: "__HA_LAN_IP__"
+  grok_bridge_port: "10700"
+  # Must equal the add-on's client_token option. [A-Za-z0-9._-], <=64 chars.
+  grok_client_token: "__GROK_CLIENT_TOKEN__"
+
+  # (from satellite1.base.yaml)
+  temp_offset: "-3"
+  humidity_offset: "5"
+  node_name: ${name}
+  company_name: FutureProofHomes
+  project_name: Satellite1
+  component_name: Core
+
+  # (from common/voice_assistant.yaml)
+  voice_assist_idle_phase_id: '1'
+  voice_assist_waiting_for_command_phase_id: '2'
+  voice_assist_listening_for_command_phase_id: '3'
+  voice_assist_thinking_phase_id: '4'
+  voice_assist_replying_phase_id: '5'
+  voice_assist_not_ready_phase_id: '10'
+  voice_assist_error_phase_id: '11'
+
+esphome:
+  name: ${name}
+  name_add_mac_suffix: false
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.0
+  compile_process_limit: 1   # needed on the HA ESPHome add-on (RAM)
+  project:
+    name: ${company_name}.${project_name}
+    version: ${esp32_fw_version}
+  on_boot:
+    - priority: -100
+      then:
+        - logger.log: "${company_name} ${project_name} ${component_name} running ESP firmware: ${esp32_fw_version} and XMOS firmware: ${xmos_fw_version}"
+        - script.execute: control_leds
+        - delay: 1s
+        - lambda: |
+            if( !id(line_out_sensor).state && id(dac_proxy).active_dac == 1){
+              id(dac_proxy).activate_speaker();
+            }
+        - delay: 10min
+        - if:
+            condition:
+              lambda: return id(init_in_progress);
+            then:
+              - lambda: id(init_in_progress) = false;
+              - script.execute: control_leds
+    # "Hey Grok" is the only active wake word. Model enable state is persisted in flash and HA can toggle
+    # wake words, so enforce it at every boot (on_wake_word_detected also ignores other words).
+    - priority: -200
+      then:
+        - micro_wake_word.enable_model: hey_grok
+        - micro_wake_word.disable_model: hey_jarvis
+        - micro_wake_word.disable_model: okay_nabu
+
+packages:
+  core_board: github://futureproofhomes/satellite1-esphome/config/common/core_board.yaml@v0.2.1
+  wifi: github://futureproofhomes/satellite1-esphome/config/common/wifi_improv.yaml@v0.2.1
+  sensors: github://futureproofhomes/satellite1-esphome/config/common/hat_sensors.yaml@v0.2.1
+  buttons: github://futureproofhomes/satellite1-esphome/config/common/buttons.yaml@v0.2.1
+  ha: github://futureproofhomes/satellite1-esphome/config/common/home_assistant.yaml@v0.2.1
+  spk: github://futureproofhomes/satellite1-esphome/config/common/speaker.yaml@v0.2.1
+  mp: github://futureproofhomes/satellite1-esphome/config/common/media_player.yaml@v0.2.1
+  timer: github://futureproofhomes/satellite1-esphome/config/common/timer.yaml@v0.2.1
+  led_ring: github://futureproofhomes/satellite1-esphome/config/common/led_ring.yaml@v0.2.1
+  mmwave: github://futureproofhomes/satellite1-esphome/config/common/mmwave.yaml@v0.2.1
+  sendspin: github://futureproofhomes/satellite1-esphome/config/common/sendspin.yaml@v0.2.1
+  dashboard_build: github://futureproofhomes/satellite1-esphome/config/common/dashboard_build.yaml@v0.2.1
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/FutureProofHomes/Satellite1-ESPHome
+      ref: v0.2.1
+    components: [fusb302b, i2s_audio, satellite1, satellite1_radar, tas2780]
+  # grok_stream lives in components/grok_stream of the published add-on repo
+  - source: github://mtfang/grok-voice-addon@main
+    refresh: 0s
+    components: [grok_stream]
+
+  # rawtap: sat1_rawtap microphone platform + memory_flasher (base64 image support)
+  - source: github://mtfang/grok-voice-addon@rawtap
+    refresh: 0s
+    components: [sat1_rawtap, memory_flasher]
+esp32:
+  framework:
+    # FPH v0.2.1 satellite1_radar includes <cJSON.h>; ESPHome 2026.9 no longer builds IDF's json component.
+    components:
+      - name: espressif/cjson
+        ref: "^1.7.18"
+
+api:
+  encryption:
+    key: "__API_ENCRYPTION_KEY__"      # keep the device's existing key (injected at flash time)
+
+logger:
+  level: ${log_level}
+
+# ---------------- from satellite1.base.yaml (v0.2.1), unchanged ----------------
+globals:
+  # set when the action button ended a live Grok session, so the same click doesn't also start stock Assist
+  - id: grok_button_dismissed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: init_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: warning
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: xmos_flashing_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: pd_power_contract
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: voice_assistant_phase
+    type: int
+    restore_value: no
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+
+fusb302b:
+  id: pd_fusb302b
+  irq_pin: GPIO1
+  request_voltage: 20
+  on_power_ready:
+    then:
+      - logger.log:
+          format: "PD contract got accepted: %s"
+          args: ['id(pd_fusb302b).contract.c_str()']
+      - text_sensor.template.publish:
+          id: pd_state_text
+          state: !lambda 'return id(pd_fusb302b).contract;'
+      - lambda: id(pd_power_contract) = id(pd_fusb302b).contract_voltage;
+      - script.execute: tas2780_ensure_active
+
+http_request:
+
+safe_mode:
+
+status_led:
+  pin:
+    number: GPIO45
+    ignore_strapping_warning: true
+
+satellite1:
+  id: satellite1_id
+  spi_id: spi_0
+  cs_pin: GPIO10
+  data_rate: 8000000
+  spi_mode: MODE3
+  xmos_rst_pin: GPIO4
+  on_xmos_no_response:
+    then:
+      - text_sensor.template.publish:
+          id: xmos_firmware_version_text
+          state: !lambda 'return id(satellite1_id).status_string();'
+  on_xmos_connected:
+    then:
+      - text_sensor.template.publish:
+          id: xmos_firmware_version_text
+          state: !lambda 'return id(satellite1_id).status_string();'
+
+memory_flasher:
+  - platform: satellite1
+    id: xflash
+    embed_flash_image:
+      image_version: ${xmos_fw_version}
+      image_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.1/satellite1_rawtap.factory.bin.b64
+      md5_file: https://raw.githubusercontent.com/mtfang/grok-voice-addon/rawtap/firmware/xmos/rawtap/v1.0.3-dev.1/satellite1_rawtap.factory.md5
+    on_flashing_start:
+      then:
+        - lambda: id(xmos_flashing_state) = 1;
+        - script.execute: control_leds
+    on_progress_update:
+      then:
+        - lambda: id(global_led_animation_index) = id(xflash).flashing_progress * 24 / 100;
+        - script.execute: control_leds
+    on_flashing_success:
+      then:
+        - logger.log: "success called"
+        - lambda: id(xmos_flashing_state) = 2;
+        - script.execute: control_leds
+        - lambda: id(xmos_flashing_state) = 0;
+        - if:
+            condition:
+              lambda: |-
+                return id(pd_fusb302b).contract_voltage >= 9;
+            then:
+              - tas2780.activate:
+                  mode: 2
+            else:
+              - tas2780.activate:
+                  mode: 0
+    on_flashing_failed:
+      then:
+        - logger.log: "failed called"
+        - lambda: id(xmos_flashing_state) = 3;
+        - script.execute: control_leds
+        - lambda: id(xmos_flashing_state) = 0;
+    on_erasing_done:
+      then:
+        - if:
+            condition:
+              lambda: return id(factory_reset_requested);
+            then:
+              - button.press: factory_reset_button
+
+# ---------------- from common/voice_assistant.yaml (v0.2.1); only on_wake_word_detected changed ----------------
+microphone:
+  - platform: sat1_rawtap
+    id: sat1_mics
+    sweep_speaker: grok_resampling_speaker   # only used by the "Rawtap capture 10 s + sweep" button
+    sample_rate: 48000
+    i2s_din_pin: GPIO15
+    bits_per_sample: 32bit
+    channel: stereo
+    pdm: false
+    adc_type: external
+    i2s_audio_id: i2s_shared
+    # rawtap XMOS: decoded to ch0 = AEC+IC+NS+AGC, ch1 = AEC+IC+NS (16-bit), raw ref/E/W/N/S for capture.
+    # Falls back to stock decoding automatically if the XMOS runs stock v1.0.3.
+
+micro_wake_word:
+  id: mww
+  models:
+    - model: https://microwakeword.com/api/models/1474/manifest.json
+      id: hey_grok
+    - model: https://fph-firmware-assets.s3.us-east-1.amazonaws.com/wake-word/hey_jarvis.json
+      id: hey_jarvis
+    - model: https://fph-firmware-assets.s3.us-east-1.amazonaws.com/wake-word/okay_nabu.json
+      id: okay_nabu
+    - model: https://fph-firmware-assets.s3.us-east-1.amazonaws.com/wake-word/stop.json
+      id: stop
+      internal: true
+  vad:
+  microphone:
+    microphone: sat1_mics
+    channels: 1
+    gain_factor: 6
+  stop_after_detection: false
+  on_wake_word_detected:
+    - if:
+        condition:
+          switch.is_off: master_mute_switch
+        then:
+          - if:
+              condition:
+                switch.is_on: timer_ringing
+              then:
+                - switch.turn_off: timer_ringing
+              else:
+                - if:
+                    condition:
+                      grok_stream.is_running: grok
+                    then:
+                      # During a live Grok conversation wake words (and the stop word) do NOT end it: Grok's own
+                      # voice or an interruption ("stop, ...") could trip them; barge-in is handled by the bridge.
+                      # Only the action button, the hang_up tool, idle/max timeouts or the switch end a session.
+                      - logger.log:
+                          format: "Ignoring wake word '%s' during a live Grok session"
+                          args: ['wake_word.c_str()']
+                    else:
+                      - if:
+                          condition:
+                            voice_assistant.is_running:
+                          then:
+                            - voice_assistant.stop:
+                          else:
+                            - if:
+                                condition:
+                                  media_player.is_announcing:
+                                    id: external_media_player
+                                then:
+                                  - media_player.stop:
+                                      announcement: true
+                                      id: external_media_player
+                                else:
+                                  # Only "Hey Grok" starts anything (hey_jarvis/okay_nabu are compiled but disabled).
+                                  - if:
+                                      condition:
+                                        lambda: 'return wake_word == "Hey Grok";'
+                                      then:
+                                        - if:
+                                            condition:
+                                              switch.is_on: wake_sound
+                                            then:
+                                              - script.execute:
+                                                  id: play_sound
+                                                  priority: true
+                                                  sound_file: "wake_word_triggered_sound"
+                                        - if:
+                                            condition:
+                                              switch.is_on: grok_live_switch
+                                            then:
+                                              - lambda: id(grok).set_device_volume(id(external_media_player).volume);
+                                              - grok_stream.start: grok
+                                            else:
+                                              - delay: 300ms
+                                              - voice_assistant.start:
+                                                  wake_word: !lambda return wake_word;
+                                      else:
+                                        - logger.log:
+                                            format: "Ignoring wake word '%s' (only Hey Grok is active)"
+                                            args: ['wake_word.c_str()']
+
+voice_assistant:
+  id: va
+  microphone:
+    microphone: sat1_mics
+    channels: 0
+  media_player: external_media_player
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 0
+  auto_gain: 0 dbfs
+  volume_multiplier: 1
+  on_client_connected:
+    - lambda: id(init_in_progress) = false;
+    - micro_wake_word.start:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+    - script.execute: control_leds
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - script.execute: control_leds
+  on_error:
+    - if:
+        condition:
+          and:
+            - lambda: return !id(init_in_progress);
+            - lambda: return code != "duplicate_wake_up_detected";
+        then:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_error_phase_id};
+          - script.execute: control_leds
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+  on_start:
+    - if:
+        condition:
+          lambda: return id(grok_button_dismissed);
+        then:
+          # this click already ended a live Grok conversation; don't start Assist too
+          - lambda: id(grok_button_dismissed) = false;
+          - voice_assistant.stop:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+  on_listening:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+    - script.execute: control_leds
+  on_stt_vad_start:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+    - script.execute: control_leds
+  on_stt_vad_end:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+    - script.execute: control_leds
+  on_intent_progress:
+    - if:
+        condition:
+          lambda: 'return !x.empty();'
+        then:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+          - script.execute: control_leds
+          - script.execute: activate_stop_word_once
+  on_tts_start:
+    - if:
+        condition:
+          lambda: 'return id(voice_assistant_phase) != ${voice_assist_replying_phase_id};'
+        then:
+          - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+          - script.execute: control_leds
+          - script.execute: activate_stop_word_once
+  on_end:
+    - wait_until:
+        not:
+          voice_assistant.is_running:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+    - script.stop: activate_stop_word_if_tts_step_is_long
+    - if:
+        condition:
+          lambda: return id(voice_assistant_phase) == ${voice_assist_error_phase_id};
+        then:
+          - delay: 1s
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+    - script.execute: control_leds
+  on_timer_finished:
+    - switch.turn_on: timer_ringing
+  on_timer_started:
+    - script.execute: control_leds
+  on_timer_cancelled:
+    - script.execute: control_leds
+  on_timer_updated:
+    - script.execute: control_leds
+  on_timer_tick:
+    - script.execute: control_leds
+
+script:
+  - id: activate_stop_word_if_tts_step_is_long
+    then:
+      - delay: 1s
+  - id: activate_stop_word_once
+    then:
+      - delay: 1s
+      - if:
+          condition:
+            switch.is_off: timer_ringing
+          then:
+            - micro_wake_word.enable_model: stop
+            - wait_until:
+                not:
+                  media_player.is_announcing:
+                    id: external_media_player
+            - if:
+                condition:
+                  switch.is_off: timer_ringing
+                then:
+                  - micro_wake_word.disable_model: stop
+
+select:
+  - platform: template
+    id: mww_sensitivity_select
+    name: "Wake word sensitivity"
+    optimistic: true
+    initial_option: Slightly sensitive
+    restore_value: true
+    entity_category: config
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    on_value:
+      lambda: |-
+        // hey_grok (microwakeword.com model 1474): Moderately = manifest cutoff 0.5 (same as the previous firmware)
+        if (x == "Slightly sensitive") id(hey_grok).set_probability_cutoff(153);
+        else if (x == "Moderately sensitive") id(hey_grok).set_probability_cutoff(128);
+        else if (x == "Very sensitive") id(hey_grok).set_probability_cutoff(102);
+        if (x == "Slightly sensitive") {
+          id(okay_nabu).set_probability_cutoff(217);
+          id(hey_jarvis).set_probability_cutoff(247);
+        } else if (x == "Moderately sensitive") {
+          id(okay_nabu).set_probability_cutoff(176);
+          id(hey_jarvis).set_probability_cutoff(235);
+        } else if (x == "Very sensitive") {
+          id(okay_nabu).set_probability_cutoff(143);
+          id(hey_jarvis).set_probability_cutoff(212);
+        }
+
+# ---------------- Grok live ----------------
+speaker:
+  # Dedicated mixer input so live audio never fights the announcement/media pipelines.
+  - id: !extend mixing_speaker
+    source_speakers:
+      - id: grok_mixing_input
+        timeout: never
+        buffer_duration: 100ms
+  - platform: resampler
+    id: grok_resampling_speaker
+    output_speaker: grok_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+    buffer_duration: 500ms
+
+switch:
+  - platform: template
+    id: grok_live_switch
+    name: Grok live voice
+    icon: mdi:account-voice
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    on_turn_off:
+      - if:
+          condition:
+            grok_stream.is_running: grok
+          then:
+            - grok_stream.stop:
+                id: grok
+                reason: ha_switch_off
+
+grok_stream:
+  id: grok
+  host: ${grok_bridge_host}
+  port: ${grok_bridge_port}
+  token: ${grok_client_token}
+  microphone:
+    microphone: sat1_mics
+    channels: 1                 # XMOS ch1 = AEC+IC+NS without AGC (ch0's AGC pumps residual echo up)
+    gain_factor: 6              # fixed gain, like micro_wake_word on ch1; fine-tune with the add-on's input_gain_db
+  speaker: grok_resampling_speaker
+  idle_timeout: 30s             # no bytes from the add-on for 30 s (it pings every 5 s) -> hang up
+  max_duration: 660s            # safety net only; the add-on decides (dismissal / idle_timeout_s / max_session_s 600)
+  on_start:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 20
+        duration: 0.0s
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+    - script.execute: control_leds
+  on_state:
+    - lambda: |-
+        if (x == "speaking") id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+        else if (x == "thinking") id(voice_assistant_phase) = ${voice_assist_thinking_phase_id};
+        else if (x == "interrupted") id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+        else id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+    - script.execute: control_leds
+  on_end:
+    - logger.log:
+        format: "Grok live session ended: %s"
+        args: ['x.c_str()']
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+    - lambda: |-
+        id(voice_assistant_phase) = (x == "connect_failed") ? ${voice_assist_error_phase_id} : ${voice_assist_idle_phase_id};
+    - script.execute: control_leds
+    - if:
+        condition:
+          lambda: 'return x == "connect_failed";'
+        then:
+          - delay: 1s
+          - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+          - script.execute: control_leds
+
+# Action button during a live Grok conversation: end it (the stock single-click handler would start Assist).
+binary_sensor:
+  - id: !extend btn_action
+    on_press:
+      - if:
+          condition:
+            grok_stream.is_running: grok
+          then:
+            - lambda: id(grok_button_dismissed) = true;
+            - grok_stream.stop:
+                id: grok
+                reason: action_button
+            - delay: 2s
+            - lambda: id(grok_button_dismissed) = false;
+
+# ---------------- rawtap capture (diagnostics) ----------------
+# Captures 10 s of the 7 decoded channels (ch0, ch1, ref, E, W, N, S; s16, 16 kHz) to PSRAM and then dumps them as
+# base64 "RTD" log lines (tag "rawtap"), read back from the device logs.
+button:
+  - platform: template
+    id: rawtap_capture_btn
+    name: "Rawtap capture 10 s"
+    icon: mdi:record-rec
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(sat1_mics).start_capture(10000, false);
+  - platform: template
+    id: rawtap_capture_sweep_btn
+    name: "Rawtap capture 10 s + sweep"
+    icon: mdi:sine-wave
+    entity_category: diagnostic
+    on_press:
+      - if:
+          condition:
+            not:
+              grok_stream.is_running: grok
+          then:
+            - lambda: id(sat1_mics).start_capture(10000, true, -30.0f);
+  - platform: template
+    id: rawtap_redump_btn
+    name: "Rawtap re-dump last capture"
+    icon: mdi:file-replace-outline
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(sat1_mics).start_dump(0);
+
+text_sensor:
+  - platform: template
+    id: rawtap_status_text
+    name: "XMOS tap status"
+    icon: mdi:sync
+    entity_category: diagnostic
+    update_interval: 15s
+    lambda: return id(sat1_mics).tap_status();
