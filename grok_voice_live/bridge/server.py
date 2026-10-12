@@ -402,6 +402,13 @@ class EchoModel:
         # chunk with play time tp covers [tp, tp + 40 ms]; widen by one frame for timing slop
         return self.out.env_db(t - 0.040 - self.FR, t + self.FR)
 
+    def onset_expected(self, t: float, t0: float) -> float:
+        """Reply onset: the device starts playing up to a few hundred ms off the estimated time, and the XMOS AEC
+        has to re-converge (measured on ch1: echo at about 0 dB coupling vs -10..-13 dB steady state for ~1 s).
+        Predict from the loudest output anywhere in the reply so far (plus what was already sent), ignoring lag."""
+        o = self.out.env_db(t0 - 0.05, t + 0.4)
+        return 10 * math.log10(10 ** (self.noise / 10) + 10 ** ((o + max(self.coupling, self.peak)) / 10))
+
     def expected(self, t: float) -> float:
         return 10 * math.log10(10 ** (self.noise / 10) + 10 ** ((self.out_at(t - self.lag) + self.coupling) / 10))
 
@@ -688,12 +695,6 @@ class Connection:
         ring: collections.deque | None = collections.deque(maxlen=ring_n) if ring_n > 0 else None
         sil = {"raw": None, "t": 0.0, "raw_max": 0.0, "clean_max": 0.0, "raw_db": -120.0, "clean_db": -120.0,
                "clipped": 0, "limited": 0}
-        if ring is not None:
-            try:
-                from livekit.plugins.silero import onnx_model as _om
-                sil["raw"] = _om.OnnxModel(onnx_session=_om.new_inference_session(False), sample_rate=16000)
-            except Exception as e:
-                log.warning("debug: no second Silero for the raw mic: %r", e)
         # VAD gate: the Satellite1's XMOS ASR channel is auto-gained, so between utterances the room noise floor
         # sits around -25 dBFS RMS. xAI's server VAD can take that for ongoing speech and never end the turn (seen
         # on the device: speech_started, transcripts, but no speech_stopped / no reply). The bridge runs Silero
@@ -898,14 +899,12 @@ class Connection:
                     if out.playing(now_s, tail_s):
                         g16 = np.frombuffer(gained_pl, "<i2").astype(np.float32) / 32768
                         c16 = np.frombuffer(payload, "<i2").astype(np.float32) / 32768
-                        if sil["raw"] is not None and len(g16) == 512:
-                            sil["raw_max"] = max(sil["raw_max"], float(sil["raw"](g16)))
                         sil["raw_db"] = max(sil["raw_db"], 20 * math.log10(float(np.sqrt(np.mean(g16 ** 2))) + 1e-6))
                         sil["clean_db"] = max(sil["clean_db"], 20 * math.log10(float(np.sqrt(np.mean(c16 ** 2))) + 1e-6))
                         if now_s - sil["t"] >= 1.0:
-                            log.debug("while playing (1 s): Silero max p raw %.2f / cleaned %.2f; loudest frame raw "
-                                      "%.1f / cleaned %.1f dBFS; limited %d samples", sil["raw_max"], sil["clean_max"],
-                                      sil["raw_db"], sil["clean_db"], sil["limited"])
+                            log.debug("while playing (1 s): Silero max p %.2f; loudest frame gained %.1f / cleaned "
+                                      "%.1f dBFS; limited %d samples", sil["clean_max"], sil["raw_db"], sil["clean_db"],
+                                      sil["limited"])
                             sil.update(t=now_s, raw_max=0.0, clean_max=0.0, raw_db=-120.0, clean_db=-120.0, limited=0)
                 n = len(payload) // (2 * ch)
                 fr = rtc.AudioFrame(payload, rate, ch, n)
@@ -987,6 +986,8 @@ class Connection:
                 if in_echo:
                     sil["clean_max"] = max(sil["clean_max"], p)
                 expected = em.expected(now)
+                if now - out.seg_t0 < float(o["barge_onset_s"]):
+                    expected = max(expected, em.onset_expected(now, out.seg_t0))
                 excess = mic - expected
                 if not in_echo and not echo["start_in_echo"]:
                     if ec is not None:

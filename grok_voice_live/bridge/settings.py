@@ -24,7 +24,7 @@ DEFAULTS = {
     "vad_gate": True,            # send xAI silence while local Silero VAD hears no speech (noisy AGC'd mic)
     "vad_gate_preroll_ms": 600,
     "tool_reply_protect_s": 2.5, # no barge-in during the first seconds of a spoken tool result
-    "barge_onset_s": 1.2,
+    "barge_onset_s": 2.0,         # reply onset window (0.4.6: echo there is ~10 dB above steady state on ch1)
     "barge_frac_floor": 0.5,     # min fraction of frames above echo+margin while Grok's audio plays
     "barge_strict_until_s": 0.0, # strict at the start of each reply until the echo model re-fits (cap)
     "barge_hv_from_db": -6.0,    # echo coupling where the loud-playback strictness starts ...
@@ -50,7 +50,7 @@ DEFAULTS = {
     "barge_threshold": 0.8,      # Silero probability required during agent audio (normal gate uses 0.6)
     "barge_min_speech_ms": 224,  # sustained speech needed to interrupt (288 before 0.4.3, tuned on AGC'd ch0)
     "barge_margin_db": 3.0,      # a frame counts as "user" when the mic is this far above the predicted echo
-    "barge_onset_extra_db": 8.0, # extra margin during the first 0.8 s of each reply
+    "barge_onset_extra_db": 12.0, # extra margin during the reply onset window (barge_onset_s)
     "barge_frac": 0.4,           # share of frames in the barge window that must count as "user"
     "barge_echo_init_db": -10.0, # starting echo coupling (mic dBFS minus output dBFS); learned per device and
                                  # kept across restarts. XMOS ch1 (no AGC) measures -13..-17 dB (+2..+3 on AGC'd ch0)

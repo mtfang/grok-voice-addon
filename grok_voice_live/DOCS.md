@@ -141,3 +141,12 @@ and every log line is tagged `[device-name]`.
   once per second, Silero's max speech probability on the gained raw input and on the cleaned signal.
 - **Debug downloads** (`debug_http`, off): read-only listing of the dump WAVs on the add-on's ingress page
   (HA login required; only the Supervisor ingress proxy may connect). Turn it off after debugging.
+
+## 0.4.6
+
+- **No more self-interruption at reply starts.** On XMOS ch1 the first ~1 s of every reply carries echo about
+  10 dB above the steady state (AEC re-converging; device playback starts a few hundred ms off the estimate), which
+  the 0.4.3 thresholds took for the user. During the first `barge_onset_s` (now 2.0 s) of a reply the predicted
+  echo is the loudest output of the reply so far (lag ignored), and the onset margin is 12 dB (`barge_onset_extra_db`).
+  Interruptions in the first 2 s of a reply need to be clearly louder than Grok; later ones are unchanged.
+- `debug_ring_s` up to 180 s; the per-second "while playing" debug line shows the cleaned-signal Silero maximum.
