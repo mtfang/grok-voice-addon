@@ -116,6 +116,7 @@ class EchoCanceller:
             self.Tm0 = t_arrival - n / FS
         self.mic_hist = np.roll(self.mic_hist, -n); self.mic_hist[-n:] = d
         m0 = self.m; self.m += n; self.frames += 1
+        self.last_ref = None                      # debug: reference block aligned with this mic block (echo delay)
         if self.T0 is None or n != N:
             return pcm
         # mic sample m0 <-> ref index (aligned by wall clock), minus the bulk echo delay
@@ -136,6 +137,7 @@ class EchoCanceller:
             return pcm
         r0 = r_now - self.delay + N // 4          # taps cover echo delays [delay - 8 ms, delay + 24 ms]
         x2 = self._ref_block(r0 - N, 2 * N)       # previous + current block
+        self.last_ref = self._ref_block(r_now - self.delay, N)   # debug: echo-aligned reference
         if not x2.any():
             return pcm
         X = np.fft.fft(x2)

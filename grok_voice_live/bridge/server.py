@@ -466,6 +466,61 @@ ECHO_STATE: dict[str, tuple[float, float, float]] = {}   # device -> (lag s, cou
 ECHO_CANCELLERS: dict[str, EchoCanceller] = {}            # device -> canceller (learned echo path survives sessions)
 ACTIVE: dict[str, asyncio.Task] = {}
 ECHO_PEAK: dict[str, float] = {}                          # device -> loudest echo coupling seen (dB)
+_LIM_KNEE = 0.5                                           # input soft limiter knee (-6 dBFS)
+
+
+def _write_ring(d: str, device: str, blocks: list) -> None:
+    """Debug ring -> 4-channel 16 kHz WAV: ch1 raw device input, ch2 after gain + limiter, ch3 echo-cancelled
+    (what Silero and xAI get), ch4 echo-aligned reference (Grok's output as the canceller sees it)."""
+    try:
+        os.makedirs(d, exist_ok=True)
+        chans = [np.concatenate([np.frombuffer(b[i], "<i2") for b in blocks]) for i in range(4)]
+        n = min(len(c) for c in chans)
+        inter = np.stack([c[:n] for c in chans], axis=1).astype("<i2")
+        path = os.path.join(d, time.strftime("ring_%Y%m%d_%H%M%S") + f"_{device}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(4); w.setsampwidth(2); w.setframerate(16000); w.writeframes(inter.tobytes())
+        log.info("debug ring written: %s (%.1f s; raw, gained, cleaned, reference)", path, n / 16000)
+    except Exception as e:
+        log.warning("debug ring not written: %r", e)
+
+
+async def _debug_http(opts) -> None:
+    """Read-only listing/download of debug_dump_dir over HA ingress (only the Supervisor's ingress proxy,
+    which requires an HA login, is allowed to connect)."""
+    from aiohttp import web
+    root = os.path.realpath(opts["debug_dump_dir"])
+
+    @web.middleware
+    async def only_ingress(request, handler):
+        if request.remote not in ("172.30.32.2", "127.0.0.1"):
+            raise web.HTTPForbidden()
+        return await handler(request)
+
+    async def index(request):
+        try:
+            names = sorted((f for f in os.listdir(root) if f.endswith(".wav")), reverse=True)
+        except FileNotFoundError:
+            names = []
+        rows = "".join(f'<li><a href="f/{n}">{n}</a> ({os.path.getsize(os.path.join(root, n)) // 1024} kB)</li>'
+                       for n in names)
+        return web.Response(text=f"<html><body><h3>Grok Voice debug dumps</h3><ul>{rows}</ul></body></html>",
+                            content_type="text/html")
+
+    async def get(request):
+        name = os.path.basename(request.match_info["name"])
+        p = os.path.realpath(os.path.join(root, name))
+        if not name.endswith(".wav") or os.path.dirname(p) != root or not os.path.isfile(p):
+            raise web.HTTPNotFound()
+        return web.FileResponse(p)
+
+    app = web.Application(middlewares=[only_ingress])
+    app.router.add_get("/", index); app.router.add_get("/f/{name}", get)
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 8099).start()
+    log.info("debug dumps served over HA ingress (debug_http): %s", root)
+
+
 ECHO_STATE_FILE = os.environ.get("GROK_ECHO_STATE_FILE", "/data/echo_state.json")
 
 
@@ -627,6 +682,18 @@ class Connection:
         in_stats = AudioStats("in<-device")
         in_fmt = {"rate": 16000, "width": 2, "channels": 1}
         gain = 10 ** (float(o["input_gain_db"]) / 20.0)
+        use_lim = bool(o["input_limiter"])
+        ring_n = int(float(o["debug_ring_s"]) * 16000 / 512)
+        # debug ring: (raw in, after gain+limiter, echo-cancelled, echo-aligned reference) per mic block, int16
+        ring: collections.deque | None = collections.deque(maxlen=ring_n) if ring_n > 0 else None
+        sil = {"raw": None, "t": 0.0, "raw_max": 0.0, "clean_max": 0.0, "raw_db": -120.0, "clean_db": -120.0,
+               "clipped": 0, "limited": 0}
+        if ring is not None:
+            try:
+                from livekit.plugins.silero import onnx_model as _om
+                sil["raw"] = _om.OnnxModel(onnx_session=_om.new_inference_session(False), sample_rate=16000)
+            except Exception as e:
+                log.warning("debug: no second Silero for the raw mic: %r", e)
         # VAD gate: the Satellite1's XMOS ASR channel is auto-gained, so between utterances the room noise floor
         # sits around -25 dBFS RMS. xAI's server VAD can take that for ongoing speech and never end the turn (seen
         # on the device: speech_started, transcripts, but no speech_stopped / no reply). The bridge runs Silero
@@ -806,11 +873,40 @@ class Connection:
                     dump["w"].writeframes(part); dump["left"] -= len(part)
                     if dump["left"] <= 0:
                         dump["w"].close(); log.info("audio dump written: %s", dump["path"]); dump = None
-                if gain != 1.0:
-                    x = np.frombuffer(payload, dtype="<i2").astype(np.float32) * gain
-                    payload = np.clip(x, -32768, 32767).astype("<i2").tobytes()
+                raw_pl = payload
+                if gain != 1.0 or use_lim:
+                    x = np.frombuffer(payload, dtype="<i2").astype(np.float32) * (gain / 32768.0)
+                    a = np.abs(x)
+                    if use_lim and float(a.max()) > _LIM_KNEE:
+                        # soft knee at -6 dBFS: smooth compression toward full scale instead of hard clipping
+                        over = a > _LIM_KNEE
+                        x[over] = np.sign(x[over]) * (_LIM_KNEE + (1 - _LIM_KNEE) *
+                                                      np.tanh((a[over] - _LIM_KNEE) / (1 - _LIM_KNEE)))
+                        sil["limited"] += int(over.sum())
+                    sil["clipped"] += int((a >= 1.0).sum()) if not use_lim else 0
+                    payload = (np.clip(x, -1.0, 32767 / 32768) * 32768).astype("<i2").tobytes()
+                gained_pl = payload
                 if ec is not None and rate == 16000 and ch == 1:
                     payload = ec.process(time.monotonic(), payload)   # remove Grok's own voice
+                if ring is not None and rate == 16000 and ch == 1:
+                    r = getattr(ec, "last_ref", None) if ec is not None else None
+                    nn = len(payload) // 2
+                    ref16 = (np.zeros(nn, "<i2") if r is None or len(r) != nn
+                             else (np.clip(r, -1, 32767 / 32768) * 32768).astype("<i2"))
+                    ring.append((raw_pl, gained_pl, payload, ref16.tobytes()))
+                    now_s = time.monotonic()
+                    if out.playing(now_s, tail_s):
+                        g16 = np.frombuffer(gained_pl, "<i2").astype(np.float32) / 32768
+                        c16 = np.frombuffer(payload, "<i2").astype(np.float32) / 32768
+                        if sil["raw"] is not None and len(g16) == 512:
+                            sil["raw_max"] = max(sil["raw_max"], float(sil["raw"](g16)))
+                        sil["raw_db"] = max(sil["raw_db"], 20 * math.log10(float(np.sqrt(np.mean(g16 ** 2))) + 1e-6))
+                        sil["clean_db"] = max(sil["clean_db"], 20 * math.log10(float(np.sqrt(np.mean(c16 ** 2))) + 1e-6))
+                        if now_s - sil["t"] >= 1.0:
+                            log.debug("while playing (1 s): Silero max p raw %.2f / cleaned %.2f; loudest frame raw "
+                                      "%.1f / cleaned %.1f dBFS; limited %d samples", sil["raw_max"], sil["clean_max"],
+                                      sil["raw_db"], sil["clean_db"], sil["limited"])
+                            sil.update(t=now_s, raw_max=0.0, clean_max=0.0, raw_db=-120.0, clean_db=-120.0, limited=0)
                 n = len(payload) // (2 * ch)
                 fr = rtc.AudioFrame(payload, rate, ch, n)
                 xx = np.frombuffer(payload, dtype="<i2").astype(np.float32)
@@ -888,6 +984,8 @@ class Connection:
                     continue
                 p, mic = float(vev.probability), echo["mic_db"]
                 in_echo = out.playing(now, tail_s)
+                if in_echo:
+                    sil["clean_max"] = max(sil["clean_max"], p)
                 expected = em.expected(now)
                 excess = mic - expected
                 if not in_echo and not echo["start_in_echo"]:
@@ -1031,6 +1129,8 @@ class Connection:
             ECHO_STATE[self.device] = (em.lag, em.coupling, em.noise)
             ECHO_PEAK[self.device] = em.peak
             _save_echo_state()
+            if ring:
+                _write_ring(o["debug_dump_dir"], self.device, list(ring))
             if btask:
                 btask.cancel()
                 await vad_stream.aclose()
@@ -1157,6 +1257,11 @@ async def main() -> None:
         log.info("memory off")
     if opts["startup_checks"]:
         await startup_checks(opts)
+    if opts["debug_http"]:
+        try:
+            await _debug_http(opts)
+        except Exception:
+            log.exception("debug_http")
 
     async def on_client(reader, writer):
         peer = writer.get_extra_info("peername")[0]

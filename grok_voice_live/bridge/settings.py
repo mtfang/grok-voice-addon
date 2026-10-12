@@ -59,6 +59,11 @@ DEFAULTS = {
     "input_gain_db": 0.0,        # software gain on device mic audio before it goes to xAI
     "debug_dump_s": 0,           # >0: write the first N s of inbound (device mic) audio to a WAV
     "debug_dump_dir": "/share/grok_voice_live",
+    "debug_ring_s": 0,           # >0: keep the last N s of (raw in, after gain+limiter, echo-cancelled, reference)
+                                 # and write it as a 4-channel WAV at session close; also logs per-second Silero
+                                 # max probability on the raw and the cleaned mic while Grok plays
+    "debug_http": False,         # serve debug_dump_dir read-only over the add-on's HA ingress (HA login required)
+    "input_limiter": True,       # soft limiter after input_gain_db (knee -6 dBFS) instead of hard clipping
     "log_level": "info",
     "instructions": (
         "You are Grok, a friendly voice assistant in Michael's home, speaking English. "

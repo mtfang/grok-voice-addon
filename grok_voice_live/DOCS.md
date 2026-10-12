@@ -130,3 +130,14 @@ and every log line is tagged `[device-name]`.
   to the latest conversation are added to the instructions at session start.
 - Options: `memory_enabled` (true), `memory_retention_days` (180, pruned daily), `memory_dir`, `memory_model`.
 - Memory never leaves the HA server (it is not part of this repository; edit or delete the files freely).
+
+## 0.4.5
+
+- **Input soft limiter** (`input_limiter`, on): after `input_gain_db`, samples above -6 dBFS are compressed
+  smoothly toward full scale instead of hard-clipping.
+- **Debug ring** (`debug_ring_s`, 0 = off): keeps the last N s of the device input and writes a 4-channel 16 kHz
+  WAV (`ring_<time>_<device>.wav` in `debug_dump_dir`) at session close: ch1 raw device input, ch2 after gain and
+  limiter, ch3 echo-cancelled (what Silero and xAI get), ch4 the echo-aligned reference. While Grok plays it logs,
+  once per second, Silero's max speech probability on the gained raw input and on the cleaned signal.
+- **Debug downloads** (`debug_http`, off): read-only listing of the dump WAVs on the add-on's ingress page
+  (HA login required; only the Supervisor ingress proxy may connect). Turn it off after debugging.
