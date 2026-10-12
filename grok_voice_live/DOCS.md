@@ -164,3 +164,8 @@ the add-on's non-admin token, `ha_local_tools: true`):
   `confirmed=true` after the user said yes (otherwise the tool answers "ask the user to confirm").
 - `max_tool_steps` (8) consecutive tool calls per turn; empty/"None" arguments are dropped before HA MCP calls;
   one shared HTTP session for the xAI plugin (fixes "Unclosed client session").
+
+## 0.4.8
+
+- Debug cleanup: the ingress download page (`debug_http`) is removed. `debug_ring_s` and `debug_dump_s` stay
+  available (default 0) for future captures; session summary lines are unchanged.

@@ -497,42 +497,6 @@ def _write_ring(d: str, device: str, blocks: list) -> None:
         log.warning("debug ring not written: %r", e)
 
 
-async def _debug_http(opts) -> None:
-    """Read-only listing/download of debug_dump_dir over HA ingress (only the Supervisor's ingress proxy,
-    which requires an HA login, is allowed to connect)."""
-    from aiohttp import web
-    root = os.path.realpath(opts["debug_dump_dir"])
-
-    @web.middleware
-    async def only_ingress(request, handler):
-        if request.remote not in ("172.30.32.2", "127.0.0.1"):
-            raise web.HTTPForbidden()
-        return await handler(request)
-
-    async def index(request):
-        try:
-            names = sorted((f for f in os.listdir(root) if f.endswith(".wav")), reverse=True)
-        except FileNotFoundError:
-            names = []
-        rows = "".join(f'<li><a href="f/{n}">{n}</a> ({os.path.getsize(os.path.join(root, n)) // 1024} kB)</li>'
-                       for n in names)
-        return web.Response(text=f"<html><body><h3>Grok Voice debug dumps</h3><ul>{rows}</ul></body></html>",
-                            content_type="text/html")
-
-    async def get(request):
-        name = os.path.basename(request.match_info["name"])
-        p = os.path.realpath(os.path.join(root, name))
-        if not name.endswith(".wav") or os.path.dirname(p) != root or not os.path.isfile(p):
-            raise web.HTTPNotFound()
-        return web.FileResponse(p)
-
-    app = web.Application(middlewares=[only_ingress])
-    app.router.add_get("/", index); app.router.add_get("/f/{name}", get)
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 8099).start()
-    log.info("debug dumps served over HA ingress (debug_http): %s", root)
-
-
 ECHO_STATE_FILE = os.environ.get("GROK_ECHO_STATE_FILE", "/data/echo_state.json")
 
 
@@ -1279,11 +1243,6 @@ async def main() -> None:
         log.info("memory off")
     if opts["startup_checks"]:
         await startup_checks(opts)
-    if opts["debug_http"]:
-        try:
-            await _debug_http(opts)
-        except Exception:
-            log.exception("debug_http")
 
     async def on_client(reader, writer):
         peer = writer.get_extra_info("peername")[0]
