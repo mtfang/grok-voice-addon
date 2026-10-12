@@ -1,0 +1,216 @@
+From e3e64f30ba5de522aa48208d6d0e2fec425fd26d Mon Sep 17 00:00:00 2001
+From: box <box@local>
+Date: Sun, 11 Oct 2026 17:07:40 -0700
+Subject: [PATCH] rawtap: capture 4 PDM mics, pack ch1/ref/E/W/N/S into I2S R
+ channel (FPH_RAW_TAP=ON)
+
+---
+ firmware_version.txt                          |  2 +-
+ .../fixed_delay/audio_pipeline_dsp.h          | 16 +++++++
+ .../reference/fixed_delay/audio_pipeline_t1.c |  9 ++++
+ .../bsp_config/SATELLITE1/SATELLITE1.cmake    | 16 ++++++-
+ satellite-xmos-firmware/src/app_conf.h        | 17 +++++++
+ satellite-xmos-firmware/src/main.c            | 48 +++++++++++++++++++
+ 6 files changed, 105 insertions(+), 3 deletions(-)
+
+diff --git a/firmware_version.txt b/firmware_version.txt
+index 9001211..06a39b2 100644
+--- a/firmware_version.txt
++++ b/firmware_version.txt
+@@ -1 +1 @@
+-dev
+\ No newline at end of file
++v1.0.3-dev.1
+diff --git a/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_dsp.h b/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_dsp.h
+index 8c37f01..7fcfcb4 100644
+--- a/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_dsp.h
++++ b/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_dsp.h
+@@ -42,6 +42,12 @@ typedef struct {
+     int32_t samples[appconfAUDIO_PIPELINE_CHANNELS][appconfAUDIO_PIPELINE_FRAME_ADVANCE];
+     int32_t aec_reference_audio_samples[appconfAUDIO_PIPELINE_CHANNELS][appconfAUDIO_PIPELINE_FRAME_ADVANCE];
+     int32_t mic_samples_passthrough[appconfAUDIO_PIPELINE_CHANNELS][appconfAUDIO_PIPELINE_FRAME_ADVANCE];
++#if appconfRAW_TAP
++    /* MUST directly follow mic_samples_passthrough: rtos_mic_array_rx() writes
++     * all MIC_ARRAY_CONFIG_MIC_COUNT channels (channel-major) contiguously. */
++    int32_t mic_extra[appconfRAW_TAP_EXTRA_MICS][appconfAUDIO_PIPELINE_FRAME_ADVANCE];   /* N, S */
++    int32_t ref_tap[appconfAUDIO_PIPELINE_FRAME_ADVANCE];                                /* (refL+refR)/2, pre-AEC */
++#endif
+ 
+     /* Below is additional context needed by other stages on a per frame basis */
+     int32_t vnr_pred_flag;
+@@ -50,6 +56,16 @@ typedef struct {
+     int32_t ref_active_flag;
+ } frame_data_t;
+ 
++#if appconfRAW_TAP
++#include <stddef.h>
++_Static_assert(offsetof(frame_data_t, mic_extra) ==
++               offsetof(frame_data_t, mic_samples_passthrough) + sizeof(((frame_data_t*)0)->mic_samples_passthrough),
++               "mic_extra must directly follow mic_samples_passthrough");
++_Static_assert(offsetof(frame_data_t, mic_samples_passthrough) ==
++               offsetof(frame_data_t, aec_reference_audio_samples) + sizeof(((frame_data_t*)0)->aec_reference_audio_samples),
++               "mic_samples_passthrough must directly follow aec_reference_audio_samples");
++#endif
++
+ typedef struct stage_delay_ctx {
+     StreamBufferHandle_t delay_buf;
+ } stage_delay_ctx_t;
+diff --git a/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_t1.c b/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_t1.c
+index 670168d..449f351 100644
+--- a/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_t1.c
++++ b/satellite-xmos-firmware/audio_pipelines/reference/fixed_delay/audio_pipeline_t1.c
+@@ -45,6 +45,15 @@ static void *audio_pipeline_input_i(void *input_app_data)
+ 
+     frame_data->vnr_pred_flag = 0;
+ 
++#if appconfRAW_TAP
++    /* Keep a copy of the (pre-AEC, 16 kHz) playback reference; the reference
++     * arrays are overwritten by IC/NS output on tile 0. */
++    for (int i = 0; i < appconfAUDIO_PIPELINE_FRAME_ADVANCE; i++) {
++        frame_data->ref_tap[i] = (frame_data->aec_reference_audio_samples[0][i] >> 1) +
++                                 (frame_data->aec_reference_audio_samples[1][i] >> 1);
++    }
++#endif
++
+     memcpy(frame_data->samples, frame_data->mic_samples_passthrough, sizeof(frame_data->samples));
+ 
+     return frame_data;
+diff --git a/satellite-xmos-firmware/bsp_config/SATELLITE1/SATELLITE1.cmake b/satellite-xmos-firmware/bsp_config/SATELLITE1/SATELLITE1.cmake
+index 6f1748b..9d617d1 100644
+--- a/satellite-xmos-firmware/bsp_config/SATELLITE1/SATELLITE1.cmake
++++ b/satellite-xmos-firmware/bsp_config/SATELLITE1/SATELLITE1.cmake
+@@ -40,7 +40,18 @@ target_link_options(fph_ffva_board_support_satellite1
+ # pins 2 & 3 are not used
+ 
+ # use East as first and West as second mic
+-set(MIC_MAPPING "4, 5")
++option(FPH_RAW_TAP "Capture all 4 PDM mics and pack raw mics + AEC reference into the ESP32 I2S stream" OFF)
++if(FPH_RAW_TAP)
++    # E, W first so that the AEC/IC pipeline keeps using the same pair as stock;
++    # N, S are captured as extra channels for the raw tap only.
++    set(MIC_MAPPING "4, 5, 0, 1")
++    set(SAT1_MIC_COUNT 4)
++    set(SAT1_RAW_TAP 1)
++else()
++    set(MIC_MAPPING "4, 5")
++    set(SAT1_MIC_COUNT 2)
++    set(SAT1_RAW_TAP 0)
++endif()
+ 
+ target_compile_definitions(fph_ffva_board_support_satellite1
+     INTERFACE
+@@ -57,7 +68,8 @@ target_compile_definitions(fph_ffva_board_support_satellite1
+         MIC_ARRAY_CONFIG_SAMPLES_PER_FRAME=240
+         MIC_ARRAY_CONFIG_USE_DDR=1
+         MIC_ARRAY_CONFIG_MIC_INPUT=8
+-        MIC_ARRAY_CONFIG_MIC_COUNT=2
++        MIC_ARRAY_CONFIG_MIC_COUNT=${SAT1_MIC_COUNT}
++        appconfRAW_TAP=${SAT1_RAW_TAP}
+         MIC_ARRAY_CONFIG_INPUT_MAPPING={${MIC_MAPPING}}
+         
+         MIC_ARRAY_CONFIG_CLOCK_BLOCK_A=XS1_CLKBLK_1
+diff --git a/satellite-xmos-firmware/src/app_conf.h b/satellite-xmos-firmware/src/app_conf.h
+index 327de91..f7bdfa1 100644
+--- a/satellite-xmos-firmware/src/app_conf.h
++++ b/satellite-xmos-firmware/src/app_conf.h
+@@ -23,7 +23,24 @@
+ #define appconfAUDIO_CLOCK_FREQUENCY            MIC_ARRAY_CONFIG_MCLK_FREQ
+ #define appconfPDM_CLOCK_FREQUENCY              MIC_ARRAY_CONFIG_PDM_FREQ
+ #define appconfAUDIO_PIPELINE_SAMPLE_RATE       16000
++#ifndef appconfRAW_TAP
++#define appconfRAW_TAP 0
++#endif
++#if appconfRAW_TAP
++/* Raw tap: the mic array captures 4 mics, but the AEC/IC/NS/AGC pipeline and
++ * the I2S paths stay 2-channel exactly as in stock firmware. */
++#define appconfAUDIO_PIPELINE_CHANNELS          2
++#define appconfRAW_TAP_EXTRA_MICS               (MIC_ARRAY_CONFIG_MIC_COUNT - 2)
++/* Optional saturating left shifts applied before truncating to 16 bit (test knobs). */
++#ifndef appconfRAW_TAP_MIC_SHIFT
++#define appconfRAW_TAP_MIC_SHIFT                0
++#endif
++#ifndef appconfRAW_TAP_CH1_SHIFT
++#define appconfRAW_TAP_CH1_SHIFT                0
++#endif
++#else
+ #define appconfAUDIO_PIPELINE_CHANNELS          MIC_ARRAY_CONFIG_MIC_COUNT
++#endif
+ 
+ #ifndef appconfAUDIO_SPK_PL_SR_FACTOR
+ #define appconfAUDIO_SPK_PL_SR_FACTOR           3
+diff --git a/satellite-xmos-firmware/src/main.c b/satellite-xmos-firmware/src/main.c
+index b41c3fd..c9ec2e2 100644
+--- a/satellite-xmos-firmware/src/main.c
++++ b/satellite-xmos-firmware/src/main.c
+@@ -5,6 +5,7 @@
+ #include <xs1.h>
+ #include <xcore/channel.h>
+ #include <string.h>
++#include <stdint.h>
+ 
+ /* FreeRTOS headers */
+ #include "FreeRTOS.h"
+@@ -198,6 +199,17 @@ void audio_pipeline_input(void *input_app_data,
+ 
+ }
+ 
++#if appconfRAW_TAP
++static inline int32_t raw_tap_shl_sat(int32_t x, int sh)
++{
++    if (sh <= 0) return x;
++    int64_t y = ((int64_t)x) << sh;
++    if (y > INT32_MAX) return INT32_MAX;
++    if (y < INT32_MIN) return INT32_MIN;
++    return (int32_t)y;
++}
++#endif
++
+ int audio_pipeline_output(void *output_app_data,
+                         int32_t **output_audio_frames,
+                         size_t ch_count,
+@@ -221,6 +233,42 @@ int audio_pipeline_output(void *output_app_data,
+      // 5 : mic 1
+ 
+      if (appconfI2S_AUDIO_SAMPLE_RATE == 3*appconfAUDIO_PIPELINE_SAMPLE_RATE) {    
++#if appconfRAW_TAP
++        /*
++         * Raw-tap packing. Per 16 kHz sample n the three 48 kHz stereo frames carry:
++         *   L[3n+0..2] = ch0 (AEC+IC+NS+AGC), repeated 3x exactly like stock, so a
++         *                stock ESP32 decoder still gets valid ch0 at any phase.
++         *   R[3n+0]    = ch1 (AEC+IC+NS)[31:16]  | ref[31:17]<<1 | 1   (marker LSB = 1)
++         *   R[3n+1]    = mic E[31:16]            | mic W[31:17]<<1     (LSB = 0)
++         *   R[3n+2]    = mic N[31:16]            | mic S[31:17]<<1     (LSB = 0)
++         * The ESP32 locks onto the triplet phase by the R-word LSB pattern 1,0,0.
++         * Raw mics are pre-AEC/pre-IC PDM decimator output (DC-removed by lib_mic_array).
++         */
++        {
++            const int32_t *ch0 = tmpptr + 0 * frame_count;
++            const int32_t *ch1 = tmpptr + 3 * frame_count;        /* NS output stored in ref[1] */
++            const int32_t *mE  = tmpptr + 4 * frame_count;        /* mic_samples_passthrough[0] */
++            const int32_t *mW  = tmpptr + 5 * frame_count;        /* mic_samples_passthrough[1] */
++            const int32_t *mN  = tmpptr + 6 * frame_count;        /* mic_extra[0] */
++            const int32_t *mS  = tmpptr + 7 * frame_count;        /* mic_extra[1] */
++            const int32_t *ref = tmpptr + 8 * frame_count;        /* ref_tap */
++            for (int n = 0, f = 0; n < frame_count; n++, f += 3) {
++                uint32_t hi_ch1 = (uint32_t)raw_tap_shl_sat(ch1[n], appconfRAW_TAP_CH1_SHIFT) & 0xFFFF0000u;
++                uint32_t lo_ref = ((uint32_t)ref[n] >> 16) & 0x0000FFFEu;
++                uint32_t hi_e   = (uint32_t)raw_tap_shl_sat(mE[n], appconfRAW_TAP_MIC_SHIFT) & 0xFFFF0000u;
++                uint32_t lo_w   = ((uint32_t)raw_tap_shl_sat(mW[n], appconfRAW_TAP_MIC_SHIFT) >> 16) & 0x0000FFFEu;
++                uint32_t hi_n   = (uint32_t)raw_tap_shl_sat(mN[n], appconfRAW_TAP_MIC_SHIFT) & 0xFFFF0000u;
++                uint32_t lo_s   = ((uint32_t)raw_tap_shl_sat(mS[n], appconfRAW_TAP_MIC_SHIFT) >> 16) & 0x0000FFFEu;
++                tmp[f+0][0][0] = ch0[n];
++                tmp[f+1][0][0] = ch0[n];
++                tmp[f+2][0][0] = ch0[n];
++                tmp[f+0][0][1] = (int32_t)(hi_ch1 | lo_ref | 1u);
++                tmp[f+1][0][1] = (int32_t)(hi_e | lo_w);
++                tmp[f+2][0][1] = (int32_t)(hi_n | lo_s);
++            }
++        }
++        if (0)
++#endif
+         // duplicate to 48kHz
+         for( int in_frame=0, out_frame=0; in_frame < frame_count; in_frame++, out_frame += 3 ){
+             // CONF_CHANNEL_0_STAGE : AGC : AEC+IC+NS+AGC : indx 0       
+-- 
+2.47.3
+
